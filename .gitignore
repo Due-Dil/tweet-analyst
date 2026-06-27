@@ -16,3 +16,6 @@ venv/
 
 # OS / editor
 .DS_Store
+
+# Personal wallet address (local only)
+data/wallet.txt

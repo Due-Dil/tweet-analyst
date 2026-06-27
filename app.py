@@ -20,6 +20,7 @@ from tweetanalyst import calibration as CAL  # noqa: E402
 from tweetanalyst import data as D  # noqa: E402
 from tweetanalyst import model as M  # noqa: E402
 from tweetanalyst import pipeline as P  # noqa: E402
+from tweetanalyst import positions as POS  # noqa: E402
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -30,6 +31,93 @@ except ImportError:  # graceful: live mode just disabled
 DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 
 st.set_page_config(page_title="Elon Tweet Tracker", layout="wide")
+
+
+@st.cache_data(show_spinner="Lecture des positions…", ttl=300)
+def cached_positions(address: str, n_sims: int, token: int) -> dict:
+    return POS.analyze(address, n_sims=n_sims)
+
+
+def render_positions_page() -> None:
+    st.title("💼 Mes positions — alignement avec le modèle")
+    st.caption(
+        "Lecture seule de tes positions Polymarket par **adresse de wallet** (publique, aucune clé). "
+        "Pour chaque pari Elon ouvert : montant en jeu, P&L, et l'**edge du côté que tu détiens** "
+        "selon le modèle le plus récent → es-tu encore aligné, ou faut-il réajuster ?"
+    )
+    addr = st.text_input("Adresse du wallet Polymarket (0x…)",
+                         value=st.session_state.get("wallet", POS.load_wallet()),
+                         key="wallet").strip()
+    if addr and addr != POS.load_wallet():
+        POS.save_wallet(addr)  # remember locally for next time (git-ignored)
+    c1, c2 = st.columns([1, 4])
+    hide_dust = c2.checkbox("Masquer les positions négligeables (< $5)", value=True)
+    if c1.button("🔄 Rafraîchir"):
+        cached_positions.clear()
+        st.session_state.pos_token = st.session_state.get("pos_token", 0) + 1
+    if not addr:
+        st.info("Entre ton adresse de wallet (visible sur ton profil Polymarket) pour voir tes positions.")
+        return
+    try:
+        res = cached_positions(addr, 12000, st.session_state.get("pos_token", 0))
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Impossible de lire les positions: {e}")
+        return
+    pos, s = res["positions"], res["summary"]
+    if not pos:
+        st.info("Aucune position Elon ouverte trouvée pour ce wallet.")
+        return
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Positions ouvertes", s["n_positions"])
+    m2.metric("Valeur actuelle", f"${s['valeur_actuelle']:,.0f}")
+    m3.metric("P&L total", f"${s['pnl_total']:,.0f}")
+    m4.metric("Gain max potentiel", f"${s['gain_max_total']:,.0f}",
+              help="Somme des gains si chaque pari gagne. Plafond théorique : les tranches OUI d'un "
+                   "même marché s'excluent (une seule peut gagner), donc non réalisable en entier.")
+    m5.metric("À réajuster", s["n_misaligned"])
+    m6.metric("Exposition à revoir", f"${s['exposition_a_revoir']:,.0f}")
+
+    df = pd.DataFrame(pos)
+    if hide_dust:
+        df = df[df["valeur_actuelle"] >= 5.0]
+    df = df.sort_values("valeur_actuelle", ascending=False)
+    disp = pd.DataFrame({
+        "Marché": df["marché"].str.replace("Elon Musk # tweets ", "", regex=False),
+        "Tranche": df["tranche"], "Côté": df["côté"],
+        "Mise": df["mise"], "Valeur": df["valeur_actuelle"], "P&L": df["pnl"],
+        "Gain max": df["gain_max"],
+        "Proba modèle (côté)": df["proba_modèle_côté"], "Edge": df["edge_côté"],
+        "Statut": df["statut"],
+    })
+
+    def _hl(row):
+        if "Réajuster" in str(row["Statut"]):
+            return ["background-color: rgba(220,0,0,0.18)"] * len(row)
+        if "Aligné" in str(row["Statut"]):
+            return ["background-color: rgba(0,170,0,0.16)"] * len(row)
+        return [""] * len(row)
+
+    sty = (disp.style
+           .format({"Mise": "${:,.0f}", "Valeur": "${:,.0f}", "P&L": "${:,.0f}",
+                    "Gain max": "${:,.0f}",
+                    "Proba modèle (côté)": "{:.1%}", "Edge": "{:+.1%}"}, na_rep="—")
+           .apply(_hl, axis=1))
+    st.dataframe(sty, use_container_width=True, hide_index=True,
+                 height=min(720, 40 * (len(disp) + 1)))
+    st.caption(
+        "**Statut** : compare la proba du modèle pour ton côté au prix de marché de ce côté. "
+        "🟢 **Aligné** = le modèle te donne encore un edge (> +3 pts) → garde. "
+        "🔴 **Réajuster** = le modèle est désormais en-dessous du prix (< −3 pts) → ta position est "
+        "richement valorisée, envisage d'alléger/sortir. ≈ Neutre = pas de signal net."
+    )
+
+
+page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions"], index=0)
+if page == "💼 Mes positions":
+    render_positions_page()
+    st.stop()
+
 st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
 st.caption(
     "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
