@@ -16,6 +16,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from tweetanalyst import backtest as BT  # noqa: E402
+from tweetanalyst import calibration as CAL  # noqa: E402
 from tweetanalyst import data as D  # noqa: E402
 from tweetanalyst import model as M  # noqa: E402
 from tweetanalyst import pipeline as P  # noqa: E402
@@ -39,6 +40,13 @@ st.caption(
 
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False, ttl=900)
+def market_duration(slug: str, handle: str) -> float:
+    m = D.get_market(slug)
+    ws, we = D.resolve_window(slug, m, handle)
+    return (we - ws).total_seconds() / 86400.0
+
+
+@st.cache_data(show_spinner=False, ttl=900)
 def list_active_markets(handle: str) -> list[tuple[str, str]]:
     out = []
     for tw in D.get_trackings(handle):
@@ -49,18 +57,21 @@ def list_active_markets(handle: str) -> list[tuple[str, str]]:
 
 @st.cache_data(show_spinner=True, ttl=600)
 def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
-               half_life: float, fit_days: float, gamma: float,
-               refresh_token: int = 0) -> dict:
-    # refresh_token busts the cache on each live tick (live mode); 0 = normal 10-min cache.
+               half_life: float, fit_days: float, gamma: float | None,
+               refresh_token: int = 0, calib_token: int = 0) -> dict:
+    # refresh_token busts the cache on each live tick; calib_token busts it after a recalibration.
     now = dt.datetime.fromisoformat(now_iso) if now_iso else None
     run = P.run_forecast(slug, handle=handle, now=now, n_sims=n_sims, gamma=gamma)
     conf = M.confidence_report(run.table, run.forecast.samples,
                                run.forecast.summary()["hours_remaining"])
     daily = M.daily_forecast(run.fit, run.window_start, run.window_end)
+    duration_days = (run.window_end - run.window_start).total_seconds() / 86400.0
     # repackage to a cacheable dict (avoid caching heavy objects with live handles)
     return {
         "confidence": conf,
         "daily": daily,
+        "gamma_applied": run.gamma,
+        "duration_days": duration_days,
         "title": run.market.title,
         "window_start": run.window_start,
         "window_end": run.window_end,
@@ -104,11 +115,18 @@ else:
 n_sims = st.sidebar.select_slider("Simulations Monte-Carlo", [4000, 8000, 20000, 40000], value=20000)
 half_life = st.sidebar.slider("Demi-vie récence (jours)", 7, 60, 28)
 fit_days = st.sidebar.slider("Fenêtre fit Hawkes (jours)", 30, 180, 90)
-gamma = st.sidebar.slider(
-    "Recalibrage (sharpening γ)", 1.0, 3.0, float(P.CALIBRATED_GAMMA), 0.05,
-    help="γ>1 resserre la distribution pour corriger la sous-confiance mesurée au backtest. "
-         "1.0 = probas brutes du modèle. Valeur par défaut calibrée sur 16 semaines.",
+auto_gamma = st.sidebar.checkbox(
+    "γ auto (calibré par durée de marché)", value=True,
+    help="Choisit le sharpening γ calibré pour la durée du marché (2/3/7 j). γ corrige la "
+         "sous-confiance ; il dépend surtout du régime récent, peu de la durée.",
 )
+if auto_gamma:
+    gamma = None
+else:
+    gamma = st.sidebar.slider("Recalibrage manuel (sharpening γ)", 1.0, 3.0,
+                              float(P.CALIBRATED_GAMMA), 0.05)
+if "calib_token" not in st.session_state:
+    st.session_state.calib_token = 0
 
 override = st.sidebar.checkbox("Forcer une date 'as of' (backtest manuel)")
 now_iso = None
@@ -144,7 +162,8 @@ if st.sidebar.button("🔄 Rafraîchir les données"):
 # Run
 # --------------------------------------------------------------------------- #
 try:
-    R = cached_run(slug, handle, now_iso, n_sims, half_life, fit_days, gamma, refresh_token)
+    R = cached_run(slug, handle, now_iso, n_sims, half_life, fit_days, gamma, refresh_token,
+                   st.session_state.calib_token)
 except Exception as e:  # noqa: BLE001
     st.error(f"Erreur: {e}")
     st.stop()
@@ -164,6 +183,42 @@ c2.metric("Heures restantes", f"{remaining_h:.0f}" if not settled else "réglé"
 c3.metric("Total final (médiane)", f"{s['median']:.0f}")
 c4.metric("Intervalle 90%", f"{s['p5']:.0f}–{s['p95']:.0f}")
 c5.metric("Niveau hebdo moyen", f"{R['mean_level']:.0f}")
+
+# ---- Applied γ + per-duration recalibration ----
+dur = R["duration_days"]
+_cinfo = CAL.load_calibration().get(int(round(dur)))
+_age = CAL._age_days(_cinfo["calibrated_at"]) if _cinfo else None
+
+# Tiered recommendation banner — you recalibrate manually via the button when prompted.
+if _cinfo is None:
+    st.warning(f"🟡 **Recalibrage recommandé** — aucune calibration enregistrée pour ~{dur:.0f} j "
+               "(valeur par défaut utilisée). Clique sur **🎯 Recalibrer γ** ci-dessous.")
+elif _age is not None and _age > 21:
+    st.error(f"🔴 **Recalibrage nécessaire** — dernière calibration il y a {_age:.0f} jours. "
+             "Le régime a probablement dérivé. Clique sur **🎯 Recalibrer γ**.")
+elif _age is not None and _age > 7:
+    st.warning(f"🟡 **Recalibrage recommandé** — dernière calibration il y a {_age:.0f} jours. "
+               "Clique sur **🎯 Recalibrer γ** pour la rafraîchir.")
+
+_cwhen = f" — calibré il y a {_age:.0f} j" if _cinfo else " — valeur par défaut"
+gcol1, gcol2 = st.columns([3, 1])
+gcol1.caption(
+    f"γ appliqué = **{R['gamma_applied']:.2f}** "
+    f"({'auto, calibré pour ~%.0f j' % dur if auto_gamma else 'manuel'}{_cwhen}). "
+    f"Durée du marché ≈ **{dur:.1f} j**. "
+    + ("⚠️ Marché court : variance plus élevée, prudence." if dur < 6 else "")
+)
+if gcol2.button("🎯 Recalibrer γ (régime actuel)", help="Rejoue des fenêtres synthétiques de "
+                "cette durée sur le régime récent et réajuste γ, puis le persiste. ~1-3 min."):
+    with st.spinner(f"Calibration de γ pour ~{dur:.0f} j…"):
+        posts_c = D.load_posts(handle, start=R["now"] - dt.timedelta(days=130), end=R["now"])
+        res_c = CAL.calibrate_gamma(posts_c, R["now"], dur, n_sims=3000)
+        CAL.store_calibration(dur, res_c)  # persist so the banner clears and γ is reused
+    st.session_state.calib_token += 1
+    st.success(f"γ recalibré pour ~{dur:.0f} j = {res_c['gamma']:.2f} "
+               f"(sur {res_c['n_windows']} fenêtres, log-loss {res_c['ll_before']:.2f}→{res_c['ll_after']:.2f}). "
+               "Relancé.")
+    st.rerun()
 
 # --------------------------------------------------------------------------- #
 # Bracket table with edge
@@ -266,7 +321,10 @@ with col_r:
 # ---- Per-day forecast: actuals + estimated, over the selected market window ----
 st.markdown("#### Prévision du nombre de tweets par jour (réels + estimés)")
 dd = R["daily"]
-labels = [f"{DAYS[d['date'].weekday()]} {d['date'].day}" for d in dd]
+labels = [
+    f"{DAYS[d['date'].weekday()]} {d['date'].day}" + (" ½j" if d.get("half_day") else "")
+    for d in dd
+]
 actual = [d["actual"] for d in dd]
 est_rem = [max(d["est_median"] - d["actual"], 0) if d["status"] != "passé" else 0 for d in dd]
 fut_mask = [d["status"] != "passé" for d in dd]
@@ -290,9 +348,11 @@ figd.update_layout(height=340, barmode="stack", margin=dict(l=10, r=10, t=10, b=
                    legend=dict(orientation="h", y=1.12))
 st.plotly_chart(figd, use_container_width=True)
 st.caption(
-    "Bleu = tweets déjà postés (exacts). Orange = estimation médiane du reste de la journée / des "
-    "jours à venir, avec la barre d'incertitude 10–90 %. Le dernier jour est souvent une demi-journée "
-    "(le marché clôture le vendredi midi ET)."
+    "**Bleu** = tweets déjà postés (exacts). **Orange** = estimation médiane du reste de la journée / "
+    "des jours à venir. **Barre noire = plage 10–90 %** : dans 80 % des scénarios simulés, le total du "
+    "jour tombe dans cet intervalle (capte la variabilité et le risque de burst). "
+    "**½j** = demi-journée : le marché ouvre et clôture le vendredi **midi** ET, donc les vendredis aux "
+    "extrémités ne couvrent qu'environ 12 h → total attendu ~moitié d'un jour plein (ce n'est pas une anomalie)."
 )
 
 st.markdown("#### Rythme de tweets — intensité par jour × heure (heure ET, pondérée récence)")

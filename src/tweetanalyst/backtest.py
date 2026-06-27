@@ -77,10 +77,12 @@ def run_backtest(
     n_sims: int = 4000,
     seed: int = 7,
     level_prior_strength: float | None = 0.5,
+    grid: list | None = None,
 ) -> BacktestResult:
     brs = standard_brackets()
     hist_start = posts["created_at"].min().to_pydatetime()
-    grid = W.weekly_grid(hist_start, anchor_end, n_weeks)
+    if grid is None:
+        grid = W.weekly_grid(hist_start, anchor_end, n_weeks)
     rng = np.random.default_rng(seed)
 
     rows = []

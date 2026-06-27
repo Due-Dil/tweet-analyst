@@ -224,11 +224,16 @@ def daily_forecast(
         actual = int(
             ((posts["created_at"] >= d_start) & (posts["created_at"] < min(eff_now, d_end))).sum()
         )
+        # Hours of this calendar day that fall inside the market window (clipped at noon-to-noon
+        # edges). < ~23h => an edge half-day, which naturally has a lower expected total.
+        window_hours = (d_end - d_start).total_seconds() / 3600.0
+        half_day = window_hours < 23.0
         if d in sim_by_date:
             tot = actual + sim_by_date[d]
             status = "partiel" if d_start < eff_now < d_end else "futur"
             out.append({
                 "date": d, "actual": actual, "status": status,
+                "window_hours": window_hours, "half_day": half_day,
                 "est_median": float(np.median(tot)),
                 "est_p10": float(np.percentile(tot, 10)),
                 "est_p90": float(np.percentile(tot, 90)),
@@ -236,6 +241,7 @@ def daily_forecast(
         else:  # fully elapsed day -> known
             out.append({
                 "date": d, "actual": actual, "status": "passé",
+                "window_hours": window_hours, "half_day": half_day,
                 "est_median": float(actual), "est_p10": float(actual), "est_p90": float(actual),
             })
     return out

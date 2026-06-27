@@ -59,6 +59,30 @@ def et_cell_of_offset(window_start_utc: dt.datetime, hours_offset: float) -> int
     return int(et.dayofweek) * 24 + int(et.hour)
 
 
+def window_grid(
+    history_start_utc: dt.datetime,
+    anchor_end_utc: dt.datetime,
+    length_days: float,
+    step_days: float,
+    n_windows: int,
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Generate up to ``n_windows`` past windows of ``length_days``, stepping back by ``step_days``
+    (DST-safe via ET local time). Used to calibrate parameters per market *duration* by replaying
+    many synthetic windows of that length on the continuous tweet history.
+    """
+    out: list[tuple[dt.datetime, dt.datetime]] = []
+    end_et = utc_ts(anchor_end_utc).tz_convert(ET)
+    for k in range(n_windows):
+        w_end_et = end_et - pd.Timedelta(days=step_days * k)
+        w_start_et = w_end_et - pd.Timedelta(days=length_days)
+        w_start = w_start_et.tz_convert("UTC").to_pydatetime()
+        w_end = w_end_et.tz_convert("UTC").to_pydatetime()
+        if w_start < history_start_utc:
+            break
+        out.append((w_start, w_end))
+    return list(reversed(out))
+
+
 def weekly_grid(
     history_start_utc: dt.datetime,
     anchor_end_utc: dt.datetime,
