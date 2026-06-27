@@ -21,10 +21,10 @@ from . import data as D
 from . import windows as W
 
 # Calibrated γ per market duration (days), measured by calibrate_gamma over synthetic windows on a
-# common recent ~112-day span (June 2026). Finding: γ is nearly duration-invariant once the regime is
-# held fixed — the real driver of γ is the regime, not the market length. Use the "recalibrate" path
-# to refresh these as the regime drifts.
-DEFAULT_GAMMA_BY_DURATION: dict[int, float] = {2: 1.10, 3: 1.05, 7: 1.15}
+# common recent ~112-day span (June 2026), scored against each type's REAL bracket width (weekly~20,
+# short 2-3 day~25). Finding: γ is fairly stable once regime + bracket width are matched. Use the
+# "recalibrate" path (uses the live market's exact brackets) to refresh as the regime drifts.
+DEFAULT_GAMMA_BY_DURATION: dict[int, float] = {2: 1.05, 3: 1.10, 7: 1.10}
 
 # Runtime overrides (e.g. from the app's "recalibrate" button) take precedence.
 _RUNTIME_GAMMA: dict[int, float] = {}
@@ -43,9 +43,13 @@ def calibrate_gamma(
     n_sims: int = 3000,
     seed: int = 11,
     level_prior_strength: float | None = 1.0,
+    brackets: list | None = None,   # actual market brackets [(lo,hi,label)]; matches real width
+    bracket_width: int = 20,        # used only if ``brackets`` is None (weekly~20, short~25)
 ) -> dict:
     """Fit the sharpening γ for markets of ``duration_days`` by replaying synthetic windows over the
-    most recent ``lookback_days`` (so all durations share one recent regime)."""
+    most recent ``lookback_days`` (so all durations share one recent regime). γ is scored against the
+    market's *actual* bracket structure (``brackets``), since width varies by market (~20 weekly,
+    ~25 short) and the right γ depends on it."""
     calib_start = anchor_end - dt.timedelta(days=lookback_days)
     hist_start = max(posts["created_at"].min().to_pydatetime(), calib_start)
     n_windows = min(max_windows, int(lookback_days / max(duration_days, 0.5)) + 1)
@@ -54,9 +58,10 @@ def calibrate_gamma(
     if not grid:
         return {"duration_days": duration_days, "gamma": DEFAULT_GAMMA_BY_DURATION.get(7, 1.2),
                 "ll_before": float("nan"), "ll_after": float("nan"), "n_windows": 0}
+    brs = brackets if brackets is not None else BT.standard_brackets(width=bracket_width)
     res = BT.run_backtest(
         posts, anchor_end, checkpoints=checkpoints, n_sims=n_sims, seed=seed,
-        level_prior_strength=level_prior_strength, grid=grid,
+        level_prior_strength=level_prior_strength, grid=grid, brackets=brs,
     )
     g, ll0, ll1 = BT.fit_sharpening(res.prob_matrix, res.true_idx)
     return {

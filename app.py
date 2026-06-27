@@ -212,7 +212,9 @@ if gcol2.button("🎯 Recalibrer γ (régime actuel)", help="Rejoue des fenêtre
                 "cette durée sur le régime récent et réajuste γ, puis le persiste. ~1-3 min."):
     with st.spinner(f"Calibration de γ pour ~{dur:.0f} j…"):
         posts_c = D.load_posts(handle, start=R["now"] - dt.timedelta(days=130), end=R["now"])
-        res_c = CAL.calibrate_gamma(posts_c, R["now"], dur, n_sims=3000)
+        mkt_c = D.get_market(slug)  # calibrate against THIS market's actual brackets (width varies)
+        brs_c = [(b.low, b.high, b.label) for b in mkt_c.brackets]
+        res_c = CAL.calibrate_gamma(posts_c, R["now"], dur, n_sims=3000, brackets=brs_c)
         CAL.store_calibration(dur, res_c)  # persist so the banner clears and γ is reused
     st.session_state.calib_token += 1
     st.success(f"γ recalibré pour ~{dur:.0f} j = {res_c['gamma']:.2f} "

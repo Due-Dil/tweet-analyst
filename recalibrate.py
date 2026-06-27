@@ -38,7 +38,9 @@ def main() -> None:
             print(f"  {dur:.0f}d: fresh (γ={info['gamma']:.2f}, calibré {info['calibrated_at'][:10]}) — skip")
             continue
         print(f"  {dur:.0f}d: calibrating…", flush=True)
-        r = C.calibrate_gamma(posts, now, dur, n_sims=args.n_sims)
+        # Real bracket width by market type: weekly ~20, short 2-3 day markets ~25.
+        width = 20 if dur >= 6 else 25
+        r = C.calibrate_gamma(posts, now, dur, n_sims=args.n_sims, bracket_width=width)
         C.store_calibration(dur, r)
         print(f"  {dur:.0f}d: γ={r['gamma']:.2f}  ({r['n_windows']} windows, "
               f"log-loss {r['ll_before']:.2f}->{r['ll_after']:.2f})", flush=True)

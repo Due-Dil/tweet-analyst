@@ -17,19 +17,19 @@ from . import model as M
 from . import windows as W
 
 # Standard 20-wide brackets used across all weeks for scoring (mirrors the market design).
-STD_EDGES = list(range(0, 520, 20))  # 0,20,...,500 ; last bucket is 500+
-
-
-def standard_brackets() -> list[tuple[float, float, str]]:
-    out = [(0, 19, "<20")]
-    for lo in range(20, 500, 20):
-        out.append((lo, lo + 19, f"{lo}-{lo+19}"))
-    out.append((500, np.inf, "500+"))
+def standard_brackets(width: int = 20, n: int = 26) -> list[tuple[float, float, str]]:
+    """Generate ``n`` brackets of ``width`` tweets (last one open-ended), matching how Polymarket
+    structures these markets. Width varies by market: ~20 for weekly, ~25 for short 2-3 day markets.
+    """
+    out = [(0.0, width - 1.0, f"<{width}")]
+    for lo in range(width, width * (n - 1), width):
+        out.append((float(lo), float(lo + width - 1), f"{lo}-{lo+width-1}"))
+    top = width * (n - 1)
+    out.append((float(top), np.inf, f"{top}+"))
     return out
 
 
-def _bracket_index(total: float) -> int:
-    brs = standard_brackets()
+def _bracket_index(total: float, brs: list) -> int:
     for i, (lo, hi, _) in enumerate(brs):
         if lo <= total <= hi:
             return i
@@ -78,8 +78,11 @@ def run_backtest(
     seed: int = 7,
     level_prior_strength: float | None = 0.5,
     grid: list | None = None,
+    brackets: list | None = None,
 ) -> BacktestResult:
-    brs = standard_brackets()
+    # Score against the given bracket structure (so calibration matches the *actual* market: ~20-wide
+    # weekly, ~25-wide for short markets). Defaults to standard 20-wide.
+    brs = brackets if brackets is not None else standard_brackets(width=20)
     hist_start = posts["created_at"].min().to_pydatetime()
     if grid is None:
         grid = W.weekly_grid(hist_start, anchor_end, n_weeks)
@@ -95,7 +98,7 @@ def run_backtest(
                 (posts["created_at"] >= W.utc_ts(ws)) & (posts["created_at"] < W.utc_ts(we))
             ).sum()
         )
-        true_idx = _bracket_index(actual)
+        true_idx = _bracket_index(actual, brs)
         for frac in checkpoints:
             now = W.utc_ts(ws) + (W.utc_ts(we) - W.utc_ts(ws)) * frac
             fit = M.fit_model(posts, now.to_pydatetime())
