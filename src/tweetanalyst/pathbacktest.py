@@ -209,43 +209,8 @@ def default_variants() -> list[Rules]:
     ]
 
 
-# --------------------------------------------------------------------------- #
-# Joint (correlation-aware) Kelly sizing over the bracket partition
-# --------------------------------------------------------------------------- #
-def kelly_horserace(p: np.ndarray, q: np.ndarray, eps: float = 1e-9) -> tuple[np.ndarray, float]:
-    """Joint full-Kelly allocation over mutually-exclusive bracket outcomes (Smoczynski-Tomkins).
-
-    The brackets of a market compete for ONE outcome, so independent per-bracket Kelly double-counts
-    correlated bets and over-deploys capital (the "inflation" caveat). This sizes the JOINT bet: given
-    model probs ``p`` (renormalized over the partition) and YES prices ``q``, it returns ``f[i]`` =
-    fraction of bankroll to bet YES on bracket i, plus the cash reserve ``R``. Only positive-edge
-    brackets (with a real price) are retained; the optimum keeps ``R`` in cash and bets
-    ``f_i = p_i − R·q_i`` on the retained set, with Σf_i + R = 1. Betting YES across the partition
-    spans the whole outcome space, so explicit NO bets are unnecessary (and would be redundant)."""
-    p = np.asarray(p, float).copy()
-    q = np.clip(np.asarray(q, float), eps, 1.0 - eps)
-    s = p.sum()
-    if s <= 0:
-        return np.zeros(len(p)), 1.0
-    p = p / s
-    n = len(p)
-    # candidates: positive edge AND a real (non-sentinel) price
-    S = [i for i in range(n) if p[i] > q[i] and q[i] >= 0.01]
-    S.sort(key=lambda i: p[i] / q[i], reverse=True)
-    R = 1.0
-    while S:
-        P = float(sum(p[i] for i in S))
-        Q = float(sum(q[i] for i in S))
-        R = (1.0 - P) / (1.0 - Q) if (1.0 - Q) > eps else 0.0
-        worst = S[-1]                              # lowest p_i/q_i in the retained set
-        if p[worst] / q[worst] <= R + eps:
-            S.pop()
-        else:
-            break
-    f = np.zeros(n)
-    for i in S:
-        f[i] = max(0.0, p[i] - R * q[i])
-    return f, R
+# Joint (correlation-aware) Kelly sizing lives in ``strategy`` (shared with the live tool).
+from .strategy import kelly_horserace  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #

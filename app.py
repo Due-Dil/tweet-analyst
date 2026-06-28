@@ -137,21 +137,32 @@ def render_positions_page() -> None:
 
 @st.cache_data(show_spinner="Construction de la stratégie…", ttl=None)
 def cached_strategy(bankroll: float, kelly: float, edge_thr: float, max_sigma: float,
-                    min_obs: int, max_mkt: float, token: int) -> dict:
+                    min_obs: int, max_mkt: float, sizing: str, token: int) -> dict:
     return STR.propose(bankroll=bankroll, kelly_fraction=kelly, edge_threshold=edge_thr,
                        max_sigma_ratio=max_sigma, min_obs=min_obs,
-                       max_per_market_frac=max_mkt, n_sims=12000)
+                       max_per_market_frac=max_mkt, sizing=sizing, n_sims=12000)
 
 
 def render_strategy_page() -> None:
     st.title("🎯 Stratégie multi-marchés")
     st.caption(
-        "Plan de paris **dimensionné par Kelly fractionné** sur tous les marchés Elon actifs : pour "
-        "chaque tranche/côté à edge positif, une mise proportionnelle à `edge / (1 − prix)`. "
-        "Garde-fous : on ignore les marchés trop tôt dans leur fenêtre (edge non fiable), on cape "
-        "l'exposition par marché, on plafonne au capital. **Aide à la décision, pas un conseil "
-        "financier** — l'edge du modèle est lui-même incertain."
+        "Plan de paris **dimensionné par Kelly** sur tous les marchés Elon actifs. En mode **joint "
+        "(recommandé)**, les tranches d'un marché sont traitées comme mutuellement exclusives → "
+        "allocation conjointe (course de chevaux) : on mise les tranches sous-cotées et on garde le "
+        "reste en cash, au lieu d'arroser des paris NON corrélés. C'est le sizing validé par le "
+        "backtest (V1_joint). **Aide à la décision, pas un conseil financier.**"
     )
+    cz1, cz2 = st.columns([2, 3])
+    sizing_label = cz1.radio(
+        "Dimensionnement", ["Kelly joint (réaliste)", "Indépendant (legacy, deux côtés)"],
+        index=0, horizontal=False,
+        help="Joint = corrige la corrélation entre tranches (déploie moins, ROI/$ réaliste, YES "
+             "uniquement). Indépendant = ancien comportement deux côtés, qui sur-déploie et gonfle.")
+    sizing = "joint" if sizing_label.startswith("Kelly joint") else "naive"
+    cz2.caption("ℹ️ Le mode **joint** propose **OUI et NON** au meilleur prix réel, mais en allouant "
+                "tout **conjointement** sur l'issue unique (une seule tranche gagne) : paris cohérents "
+                "(plusieurs NON OK, OUI groupés seulement si optimal), corrélation prise en compte. "
+                "Le mode **indépendant** dimensionne chaque pari isolément (sur-déploie).")
     c1, c2, c3 = st.columns(3)
     bankroll = c1.number_input("Capital à déployer ($)", 50, 10_000_000, 1000, step=100)
     kelly = c2.slider("Fraction de Kelly", 0.05, 1.0, 0.25, 0.05,
@@ -169,7 +180,7 @@ def render_strategy_page() -> None:
                              "confiantes de marchés calmes — laisse 0 sauf besoin spécifique.")
     max_mkt = c6.slider("Expo max / marché (%)", 10, 100, 40) / 100
 
-    res = cached_strategy(bankroll, kelly, edge_pts / 100, max_sigma, min_obs, max_mkt,
+    res = cached_strategy(bankroll, kelly, edge_pts / 100, max_sigma, min_obs, max_mkt, sizing,
                           st.session_state.get("calib_token", 0))
     s, bets = res["summary"], res["bets"]
 
@@ -382,7 +393,7 @@ def _prewarm_all() -> None:
     except Exception:  # noqa: BLE001
         pass
     try:  # strategy page — default params
-        cached_strategy(1000.0, 0.25, 0.04, 1.2, 0, 0.40, calib)
+        cached_strategy(1000.0, 0.25, 0.04, 1.2, 0, 0.40, "joint", calib)
     except Exception:  # noqa: BLE001
         pass
     try:  # positions page — saved wallet
