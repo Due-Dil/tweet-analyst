@@ -21,6 +21,8 @@ from tweetanalyst import data as D  # noqa: E402
 from tweetanalyst import model as M  # noqa: E402
 from tweetanalyst import pipeline as P  # noqa: E402
 from tweetanalyst import positions as POS  # noqa: E402
+from tweetanalyst import strategy as STR  # noqa: E402
+from tweetanalyst import windows as W  # noqa: E402
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -29,6 +31,27 @@ except ImportError:  # graceful: live mode just disabled
     _HAS_AUTOREFRESH = False
 
 DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+FR_MONTHS = ["jan", "fév", "mars", "avr", "mai", "juin",
+             "juil", "août", "sept", "oct", "nov", "déc"]
+
+
+def _fmt_range(start_utc, end_utc) -> str:
+    """'26 juin → 3 juil' in ET local dates."""
+    s = W.utc_ts(start_utc).tz_convert(W.ET)
+    e = W.utc_ts(end_utc).tz_convert(W.ET)
+    return f"{s.day} {FR_MONTHS[s.month-1]} → {e.day} {FR_MONTHS[e.month-1]}"
+
+
+def _fmt_rel(seconds: float) -> str:
+    """Compact time-to-close, e.g. '6j 4h', '18h 20min', '45min', or 'clôturé'."""
+    if seconds <= 0:
+        return "clôturé"
+    d, h, m = int(seconds // 86400), int((seconds % 86400) // 3600), int((seconds % 3600) // 60)
+    if d > 0:
+        return f"{d}j {h}h"
+    if h > 0:
+        return f"{h}h {m:02d}min"
+    return f"{m}min"
 
 st.set_page_config(page_title="Elon Tweet Tracker", layout="wide")
 
@@ -72,9 +95,12 @@ def render_positions_page() -> None:
     m1.metric("Positions ouvertes", s["n_positions"])
     m2.metric("Valeur actuelle", f"${s['valeur_actuelle']:,.0f}")
     m3.metric("P&L total", f"${s['pnl_total']:,.0f}")
+    _rdt = s.get("rendement_max_pct")
     m4.metric("Gain max potentiel", f"${s['gain_max_total']:,.0f}",
-              help="Somme des gains si chaque pari gagne. Plafond théorique : les tranches OUI d'un "
-                   "même marché s'excluent (une seule peut gagner), donc non réalisable en entier.")
+              delta=(f"+{_rdt:.0%} sur la mise" if _rdt is not None else None), delta_color="off",
+              help="Somme des gains si chaque pari gagne, et rendement max sur la mise totale. "
+                   "Plafond théorique : les tranches OUI d'un même marché s'excluent (une seule peut "
+                   "gagner), donc non réalisable en entier.")
     m5.metric("À réajuster", s["n_misaligned"])
     m6.metric("Exposition à revoir", f"${s['exposition_a_revoir']:,.0f}")
 
@@ -86,7 +112,7 @@ def render_positions_page() -> None:
         "Marché": df["marché"].str.replace("Elon Musk # tweets ", "", regex=False),
         "Tranche": df["tranche"], "Côté": df["côté"],
         "Mise": df["mise"], "Valeur": df["valeur_actuelle"], "P&L": df["pnl"],
-        "Gain max": df["gain_max"],
+        "Gain max": df["gain_max"], "Rendement max": df["rendement_max"],
         "Proba modèle (côté)": df["proba_modèle_côté"], "Edge": df["edge_côté"],
         "Statut": df["statut"],
     })
@@ -100,7 +126,7 @@ def render_positions_page() -> None:
 
     sty = (disp.style
            .format({"Mise": "${:,.0f}", "Valeur": "${:,.0f}", "P&L": "${:,.0f}",
-                    "Gain max": "${:,.0f}",
+                    "Gain max": "${:,.0f}", "Rendement max": "{:.0%}",
                     "Proba modèle (côté)": "{:.1%}", "Edge": "{:+.1%}"}, na_rep="—")
            .apply(_hl, axis=1))
     st.dataframe(sty, use_container_width=True, hide_index=True,
@@ -113,9 +139,127 @@ def render_positions_page() -> None:
     )
 
 
-page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions"], index=0)
+@st.cache_data(show_spinner="Construction de la stratégie…", ttl=300)
+def cached_strategy(bankroll: float, kelly: float, edge_thr: float, max_sigma: float,
+                    min_obs: int, max_mkt: float, token: int) -> dict:
+    return STR.propose(bankroll=bankroll, kelly_fraction=kelly, edge_threshold=edge_thr,
+                       max_sigma_ratio=max_sigma, min_obs=min_obs,
+                       max_per_market_frac=max_mkt, n_sims=12000)
+
+
+def render_strategy_page() -> None:
+    st.title("🎯 Stratégie multi-marchés")
+    st.caption(
+        "Plan de paris **dimensionné par Kelly fractionné** sur tous les marchés Elon actifs : pour "
+        "chaque tranche/côté à edge positif, une mise proportionnelle à `edge / (1 − prix)`. "
+        "Garde-fous : on ignore les marchés trop tôt dans leur fenêtre (edge non fiable), on cape "
+        "l'exposition par marché, on plafonne au capital. **Aide à la décision, pas un conseil "
+        "financier** — l'edge du modèle est lui-même incertain."
+    )
+    c1, c2, c3 = st.columns(3)
+    bankroll = c1.number_input("Capital à déployer ($)", 50, 10_000_000, 1000, step=100)
+    kelly = c2.slider("Fraction de Kelly", 0.05, 1.0, 0.25, 0.05,
+                      help="¼ Kelly = prudent (moins de variance). 1.0 = Kelly plein (agressif).")
+    edge_pts = c3.slider("Edge minimum (points)", 0, 15, 4,
+                         help="Ne parie que si l'avantage modèle dépasse ce seuil.")
+    c4, c5, c6 = st.columns(3)
+    max_sigma = c4.slider("Netteté min (σ ÷ tranche)", 0.6, 3.0, 1.2, 0.1,
+                          help="Ne trade que si l'incertitude de la prévision (σ) est sous ce multiple "
+                               "de la largeur de tranche. Plus bas = plus sélectif. S'adapte à la durée "
+                               "et à la taille des tranches.")
+    min_obs = c5.slider("Plancher tweets observés (optionnel)", 0, 60, 0,
+                        help="Filtre OPTIONNEL (0 = off). Le vrai filtre est la confiance du modèle (σ "
+                             "à gauche). Un plancher sur le comptage bloquerait à tort les prévisions "
+                             "confiantes de marchés calmes — laisse 0 sauf besoin spécifique.")
+    max_mkt = c6.slider("Expo max / marché (%)", 10, 100, 40) / 100
+
+    res = cached_strategy(bankroll, kelly, edge_pts / 100, max_sigma, min_obs, max_mkt,
+                          st.session_state.get("calib_token", 0))
+    s, bets = res["summary"], res["bets"]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Paris proposés", f"{s['n_bets']} ({s['n_markets_betted']} marché·s)")
+    m2.metric("Mise totale", f"${s['mise_totale']:,.0f}",
+              delta=f"{s['mise_totale']/s['bankroll']:.0%} du capital", delta_color="off")
+    m3.metric("Gain max potentiel", f"${s['gain_max_total']:,.0f}")
+    m4.metric("Valeur attendue (EV)", f"${s['ev_total']:,.0f}",
+              help="Somme des espérances de gain (proba modèle × payoff − mise).")
+
+    if not bets:
+        st.info("Aucun pari proposé : edges sous le seuil, ou tous les marchés sont trop tôt dans "
+                "leur fenêtre. Baisse le seuil d'edge ou le % de fenêtre minimum pour être plus agressif.")
+    else:
+        st.markdown("### Plan proposé")
+        bdf = pd.DataFrame(bets)
+        bdisp = pd.DataFrame({
+            "Marché": bdf["market"].str.replace("Elon Musk # tweets ", "", regex=False),
+            "Tranche": bdf["tranche"], "Côté": bdf["côté"],
+            "Prix": bdf["prix"], "Proba gain": bdf["proba_gain"], "Edge": bdf["edge"],
+            "Mise": bdf["stake"], "Gain max": bdf["gain_max"],
+            "Rendement max": bdf["rendement_max"], "EV": bdf["ev"], "EV %": bdf["ev_pct"],
+        })
+        st.dataframe(
+            bdisp.style.format({"Prix": "{:.2f}", "Proba gain": "{:.0%}", "Edge": "{:+.1%}",
+                                "Mise": "${:,.0f}", "Gain max": "${:,.0f}",
+                                "Rendement max": "{:.0%}", "EV": "${:,.0f}", "EV %": "{:+.1%}"}),
+            use_container_width=True, hide_index=True, height=min(560, 40 * (len(bdisp) + 1)))
+        st.caption(
+            "**Proba gain** = chance que ton côté gagne (les NON à forte proba sont sûrs mais à faible "
+            "rendement). **EV %** = rendement *attendu* par $ misé (>0 seulement s'il y a un edge réel : "
+            "à prix juste, un pari à 95% de réussite a une EV nulle). Mise = ¼-Kelly, qui pondère déjà "
+            "plus les paris à forte proba à edge égal. Trié par EV."
+        )
+
+    if res["skipped"]:
+        with st.expander(f"Marchés écartés ({len(res['skipped'])})"):
+            for x in res["skipped"]:
+                st.write(f"• **{x['market'].replace('Elon Musk # tweets ', '')}** — {x['reason']}")
+
+    # ---- Signals vs current wallet positions ----
+    st.markdown("### Signaux sur tes positions actuelles")
+    wallet = POS.load_wallet()
+    if not wallet:
+        st.info("Renseigne ton wallet (page « Mes positions ») pour comparer ce plan à tes positions "
+                "et obtenir les signaux Entrer / Renforcer / Alléger / Sortir.")
+        return
+    try:
+        cur = cached_positions(wallet, 12000, st.session_state.get("pos_token", 0))["positions"]
+    except Exception as e:  # noqa: BLE001
+        st.warning(f"Positions indisponibles: {e}")
+        return
+    acts = STR.reconcile(bets, cur)
+    if not acts:
+        st.info("Aucun signal : pas de position actuelle ni de cible.")
+        return
+    adf = pd.DataFrame(acts)
+    adisp = pd.DataFrame({
+        "Action": adf["action"],
+        "Marché": adf["marché"].astype(str).str.replace("Elon Musk # tweets ", "", regex=False).str[:26],
+        "Tranche": adf["tranche"], "Côté": adf["côté"],
+        "Actuel": adf["valeur_actuelle"], "Cible": adf["cible"],
+        "Edge": adf["edge"], "Pourquoi": adf["raison"],
+    })
+
+    def _hl_act(row):
+        a = str(row["Action"])
+        col = {"🔴": "rgba(220,0,0,0.16)", "🟠": "rgba(230,150,0,0.16)",
+               "🟢": "rgba(0,170,0,0.16)", "🔵": "rgba(80,140,230,0.16)"}.get(a[:1], "")
+        return [f"background-color: {col}" if col else ""] * len(row)
+
+    st.dataframe(
+        adisp.style.format({"Actuel": "${:,.0f}", "Cible": "${:,.0f}", "Edge": "{:+.1%}"},
+                           na_rep="—").apply(_hl_act, axis=1),
+        use_container_width=True, hide_index=True, height=min(560, 40 * (len(adisp) + 1)))
+    st.caption("🔴 Sortir (le modèle n'y voit plus de valeur) · 🟠 Alléger (au-dessus de la cible) · "
+               "🟢 Entrer (nouvelle opportunité) · 🔵 Renforcer (sous la cible) · ✅ Conserver.")
+
+
+page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions", "🎯 Stratégie"], index=0)
 if page == "💼 Mes positions":
     render_positions_page()
+    st.stop()
+if page == "🎯 Stratégie":
+    render_strategy_page()
     st.stop()
 
 st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
@@ -135,12 +279,20 @@ def market_duration(slug: str, handle: str) -> float:
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def list_active_markets(handle: str) -> list[tuple[str, str]]:
+def list_active_markets(handle: str) -> list[dict]:
+    """Open markets, sorted by close date (soonest first), with readable labels."""
+    now = dt.datetime.now(dt.timezone.utc)
     out = []
     for tw in D.get_trackings(handle):
-        if tw.is_active and tw.market_link:
-            out.append((tw.title, D.slug_from_url(tw.market_link)))
-    return out
+        if tw.is_active and tw.market_link and tw.end > now:
+            dur = (tw.end - tw.start).total_seconds() / 86400.0
+            out.append({
+                "slug": D.slug_from_url(tw.market_link),
+                "range": _fmt_range(tw.start, tw.end),
+                "duration": dur,
+                "end": tw.end,
+            })
+    return sorted(out, key=lambda m: m["end"])  # closest close first
 
 
 @st.cache_data(show_spinner=True, ttl=600)
@@ -149,7 +301,8 @@ def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
                refresh_token: int = 0, calib_token: int = 0) -> dict:
     # refresh_token busts the cache on each live tick; calib_token busts it after a recalibration.
     now = dt.datetime.fromisoformat(now_iso) if now_iso else None
-    run = P.run_forecast(slug, handle=handle, now=now, n_sims=n_sims, gamma=gamma)
+    run = P.run_forecast(slug, handle=handle, now=now, n_sims=n_sims, gamma=gamma,
+                         half_life_days=half_life, fit_days=fit_days)
     conf = M.confidence_report(run.table, run.forecast.samples,
                                run.forecast.summary()["hours_remaining"])
     daily = M.daily_forecast(run.fit, run.window_start, run.window_end)
@@ -188,11 +341,16 @@ except Exception as e:  # noqa: BLE001
     markets = []
     st.sidebar.warning(f"Marchés actifs indisponibles: {e}")
 
-market_labels = [m[0] for m in markets]
 mode = st.sidebar.radio("Marché", ["Marchés actifs", "URL / slug manuel"], index=0)
 if mode == "Marchés actifs" and markets:
-    pick = st.sidebar.selectbox("Choisir", market_labels)
-    slug = dict(zip(market_labels, [m[1] for m in markets]))[pick]
+    _now = dt.datetime.now(dt.timezone.utc)
+    labels = [
+        f"⏳ {_fmt_rel((m['end'] - _now).total_seconds())}  ·  {m['range']}  ·  {m['duration']:.0f}j"
+        for m in markets
+    ]
+    idx = st.sidebar.selectbox("Choisir un marché (clôture la plus proche en premier)",
+                               range(len(markets)), format_func=lambda i: labels[i])
+    slug = markets[idx]["slug"]
 else:
     url = st.sidebar.text_input(
         "URL Polymarket ou slug",
@@ -201,8 +359,18 @@ else:
     slug = D.slug_from_url(url)
 
 n_sims = st.sidebar.select_slider("Simulations Monte-Carlo", [4000, 8000, 20000, 40000], value=20000)
-half_life = st.sidebar.slider("Demi-vie récence (jours)", 7, 60, 28)
-fit_days = st.sidebar.slider("Fenêtre fit Hawkes (jours)", 30, 180, 90)
+half_life = st.sidebar.slider(
+    "Demi-vie récence (jours)", 7, 60, 28,
+    help="Vitesse d'oubli des vieux tweets pour le profil jour×heure. Plus court = colle au "
+         "comportement très récent (réactif mais bruité) ; plus long = profil lisse et stable mais "
+         "lent à s'adapter. Défaut 28 j (générique, non optimisé par backtest).")
+fit_days = st.sidebar.slider(
+    "Fenêtre fit Hawkes (jours)", 30, 180, 90,
+    help="Historique utilisé pour estimer les paramètres de burst (α taille, β durée). Plus court = "
+         "réactif au comportement récent mais bruité ; plus long = noyau de burst plus stable. "
+         "Défaut 90 j (générique, non optimisé par backtest).")
+st.sidebar.caption("ℹ️ Laisse les valeurs par défaut sauf pour expérimenter — le reste du modèle "
+                   "(γ, niveau, tranches) est déjà calibré et adapté au marché.")
 auto_gamma = st.sidebar.checkbox(
     "γ auto (calibré par durée de marché)", value=True,
     help="Choisit le sharpening γ calibré pour la durée du marché (2/3/7 j). γ corrige la "

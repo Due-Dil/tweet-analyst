@@ -24,7 +24,7 @@ from . import windows as W
 # common recent ~112-day span (June 2026), scored against each type's REAL bracket width (weekly~20,
 # short 2-3 day~25). Finding: γ is fairly stable once regime + bracket width are matched. Use the
 # "recalibrate" path (uses the live market's exact brackets) to refresh as the regime drifts.
-DEFAULT_GAMMA_BY_DURATION: dict[int, float] = {2: 1.05, 3: 1.10, 7: 1.10}
+DEFAULT_GAMMA_BY_DURATION: dict[int, float] = {2: 1.00, 3: 1.10, 7: 1.35}
 
 # Runtime overrides (e.g. from the app's "recalibrate" button) take precedence.
 _RUNTIME_GAMMA: dict[int, float] = {}

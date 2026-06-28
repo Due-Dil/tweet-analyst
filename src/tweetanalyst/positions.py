@@ -46,7 +46,10 @@ def fetch_positions(address: str, limit: int = 500) -> list[dict]:
 
 
 def _bracket_bounds_from_title(title: str) -> tuple[float, float] | None:
-    """'Will Elon Musk post 200-219 tweets ...' -> (200, 219); handles 'X+' and '0-19'."""
+    """'...post 200-219 tweets...' -> (200, 219); handles '<N', 'N-M', and 'N+'."""
+    m = re.search(r"post\s+<\s*([0-9]+)\s+tweets", title)
+    if m:
+        return 0.0, float(m.group(1)) - 1
     m = re.search(r"post\s+([0-9]+)\s*-\s*([0-9]+)\s+tweets", title)
     if m:
         return float(m.group(1)), float(m.group(2))
@@ -118,6 +121,7 @@ def analyze(address: str, n_sims: int = 12000, now: dt.datetime | None = None) -
         "mise_totale": cost,
         "pnl_total": pnl,
         "gain_max_total": sum(r["gain_max"] for r in df_rows),
+        "rendement_max_pct": (sum(r["gain_max"] for r in df_rows) / cost) if cost > 0 else None,
         "n_misaligned": len(misaligned),
         "exposition_a_revoir": sum(r["valeur_actuelle"] for r in misaligned),
     }
@@ -134,6 +138,7 @@ def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None 
     pnl = float(p.get("cashPnl", valeur - mise))
     # Each share pays $1 if the held side wins -> max payout = size; max profit = size - cost.
     gain_max = size - mise
+    rendement_max = (gain_max / mise) if mise > 0 else None  # (1-entry)/entry
 
     model_prob = edge = status = None
     p_in = tbl["model_prob"] if tbl else None
@@ -168,6 +173,7 @@ def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None 
         "valeur_actuelle": valeur,
         "pnl": pnl,
         "gain_max": gain_max,
+        "rendement_max": rendement_max,
         "proba_modèle_côté": model_prob,
         "edge_côté": edge,
         "statut": status if not error else "❓ Non évalué",
@@ -179,4 +185,6 @@ def _label_from_title(title: str) -> str:
     if b is None:
         return title
     lo, hi = b
+    if lo == 0:
+        return f"<{int(hi) + 1}"
     return f"{int(lo)}+" if hi == float("inf") else f"{int(lo)}-{int(hi)}"

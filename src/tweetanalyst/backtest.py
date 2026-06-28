@@ -79,6 +79,7 @@ def run_backtest(
     level_prior_strength: float | None = 0.5,
     grid: list | None = None,
     brackets: list | None = None,
+    level_lookback_days: float | None = 5.0,
 ) -> BacktestResult:
     # Score against the given bracket structure (so calibration matches the *actual* market: ~20-wide
     # weekly, ~25-wide for short markets). Defaults to standard 20-wide.
@@ -103,7 +104,8 @@ def run_backtest(
             now = W.utc_ts(ws) + (W.utc_ts(we) - W.utc_ts(ws)) * frac
             fit = M.fit_model(posts, now.to_pydatetime())
             fc = M.forecast(fit, ws, we, n_sims=n_sims, rng=rng,
-                            level_prior_strength=level_prior_strength)
+                            level_prior_strength=level_prior_strength,
+                            level_lookback_days=level_lookback_days)
             samp = fc.samples
             probs = np.array(
                 [

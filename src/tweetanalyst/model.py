@@ -90,7 +90,9 @@ def forecast(
     window_end: dt.datetime,
     n_sims: int = 20000,
     rng: np.random.Generator | None = None,
-    level_prior_strength: float | None = 1.0,  # best on 16-week backtest (logloss 1.95->1.89)
+    level_prior_strength: float | None = 0.5,  # shrinkage crossover (empirical-variance prior)
+    level_lookback_days: float | None = 3.0,   # condition the level on the recent *continuous*
+                                               # stream (window-agnostic, best on backtest); None = legacy
 ) -> Forecast:
     rng = rng or np.random.default_rng(12345)
     now = fit.now
@@ -135,17 +137,29 @@ def forecast(
     ages_h = (eff_now - seed_evs).dt.total_seconds().values / 3600.0
     Z0 = H.seed_decay_sum(ages_h, beta)
 
-    # Level conditioned on the within-window pace so far (fraction of weekly seasonal mass elapsed).
-    # level_prior_strength=None disables conditioning (old prior-only behavior, for A/B testing).
+    # Condition the level on the recent pace. Window-AGNOSTIC by default: use the continuous stream
+    # over the last ``level_lookback_days`` from ``now`` (not the in-window count) so two overlapping
+    # markets at the same ``now`` share the *same* forecast of the future process. n_obs (banked, the
+    # window-specific part) is added separately below. level_prior_strength=None disables conditioning.
     if level_prior_strength is None:
         levels = fit.intensity.sample_level(rng, n_sims)
     else:
-        elapsed_mass = float(
-            sum(fit.intensity.shape[W.et_cell_of_offset(window_start, k)]
-                for k in range(int(round(now_offset))))
+        if level_lookback_days is None:  # legacy in-window conditioning (for A/B)
+            cond_count, cond_ref, cond_h = n_obs, window_start, now_offset
+        else:
+            lb_h = level_lookback_days * 24.0
+            cond_ref = (eff_now - pd.Timedelta(hours=lb_h)).to_pydatetime()
+            cond_count = int(
+                ((posts["created_at"] >= W.utc_ts(cond_ref))
+                 & (posts["created_at"] < eff_now)).sum()
+            )
+            cond_h = lb_h
+        cond_mass = float(
+            sum(fit.intensity.shape[W.et_cell_of_offset(cond_ref, k)]
+                for k in range(int(round(cond_h))))
         )
         levels = fit.intensity.sample_level_conditional(
-            rng, n_sims, n_obs, elapsed_mass, prior_strength=level_prior_strength
+            rng, n_sims, cond_count, cond_mass, prior_strength=level_prior_strength
         )
     remaining = H.simulate_remaining(
         rng, g_window, T_remaining, levels, fit.hawkes.alpha, beta, np.full(n_sims, Z0)
@@ -204,12 +218,14 @@ def daily_forecast(
             & (posts["created_at"] < eff_now), "created_at"
         ]
         Z0 = H.seed_decay_sum((eff_now - seed_evs).dt.total_seconds().values / 3600.0, beta)
-        n_obs_win = int(((posts["created_at"] >= ws) & (posts["created_at"] < eff_now)).sum())
-        elapsed_mass = float(
-            sum(fit.intensity.shape[W.et_cell_of_offset(window_start, k)]
-                for k in range(int(round(now_offset))))
-        )
-        levels = fit.intensity.sample_level_conditional(rng, n_sims, n_obs_win, elapsed_mass)
+        # window-agnostic level conditioning (recent continuous stream), consistent with forecast()
+        lb_h = 3.0 * 24.0
+        lb_ref = (eff_now - pd.Timedelta(hours=lb_h)).to_pydatetime()
+        cond_count = int(((posts["created_at"] >= W.utc_ts(lb_ref))
+                          & (posts["created_at"] < eff_now)).sum())
+        cond_mass = float(sum(fit.intensity.shape[W.et_cell_of_offset(lb_ref, k)]
+                              for k in range(int(round(lb_h)))))
+        levels = fit.intensity.sample_level_conditional(rng, n_sims, cond_count, cond_mass)
         buckets = H.simulate_remaining_daily(
             rng, g_window, T_remaining, levels, fit.hawkes.alpha, beta,
             np.full(n_sims, Z0), np.array(edges),
