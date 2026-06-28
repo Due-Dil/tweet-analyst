@@ -4,9 +4,10 @@ data/cache.db
 # Local tooling / editor config
 .claude/
 
-# Backtest outputs (regenerate with run_histbacktest.py)
+# Backtest outputs (regenerate with run_histbacktest.py / run_pathbacktest.py)
 histbacktest.png
 histbacktest_*.csv
+pathbacktest_*.csv
 
 # Python
 __pycache__/

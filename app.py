@@ -56,7 +56,7 @@ def _fmt_rel(seconds: float) -> str:
 st.set_page_config(page_title="Elon Tweet Tracker", layout="wide")
 
 
-@st.cache_data(show_spinner="Lecture des positions…", ttl=300)
+@st.cache_data(show_spinner="Lecture des positions…", ttl=None)
 def cached_positions(address: str, n_sims: int, token: int) -> dict:
     return POS.analyze(address, n_sims=n_sims)
 
@@ -73,11 +73,7 @@ def render_positions_page() -> None:
                          key="wallet").strip()
     if addr and addr != POS.load_wallet():
         POS.save_wallet(addr)  # remember locally for next time (git-ignored)
-    c1, c2 = st.columns([1, 4])
-    hide_dust = c2.checkbox("Masquer les positions négligeables (< $5)", value=True)
-    if c1.button("🔄 Rafraîchir"):
-        cached_positions.clear()
-        st.session_state.pos_token = st.session_state.get("pos_token", 0) + 1
+    hide_dust = st.checkbox("Masquer les positions négligeables (< $5)", value=True)
     if not addr:
         st.info("Entre ton adresse de wallet (visible sur ton profil Polymarket) pour voir tes positions.")
         return
@@ -139,7 +135,7 @@ def render_positions_page() -> None:
     )
 
 
-@st.cache_data(show_spinner="Construction de la stratégie…", ttl=300)
+@st.cache_data(show_spinner="Construction de la stratégie…", ttl=None)
 def cached_strategy(bankroll: float, kelly: float, edge_thr: float, max_sigma: float,
                     min_obs: int, max_mkt: float, token: int) -> dict:
     return STR.propose(bankroll=bankroll, kelly_fraction=kelly, edge_threshold=edge_thr,
@@ -216,69 +212,108 @@ def render_strategy_page() -> None:
                 st.write(f"• **{x['market'].replace('Elon Musk # tweets ', '')}** — {x['reason']}")
 
     # ---- Signals vs current wallet positions ----
-    st.markdown("### Signaux sur tes positions actuelles")
+    st.markdown("### 🎬 Actions à passer (selon le modèle + la stratégie)")
     wallet = POS.load_wallet()
     if not wallet:
         st.info("Renseigne ton wallet (page « Mes positions ») pour comparer ce plan à tes positions "
                 "et obtenir les signaux Entrer / Renforcer / Alléger / Sortir.")
         return
     try:
-        cur = cached_positions(wallet, 12000, st.session_state.get("pos_token", 0))["positions"]
+        posres = cached_positions(wallet, 12000, st.session_state.get("pos_token", 0))
     except Exception as e:  # noqa: BLE001
         st.warning(f"Positions indisponibles: {e}")
         return
+    cur = posres["positions"]
     acts = STR.reconcile(bets, cur)
+    meta_by_slug = {m["slug"]: m for m in res["markets"]}
+
+    def _clean(name: str) -> str:
+        return str(name).replace("Elon Musk # tweets ", "").replace("Elon Musk # of tweets ", "")
+
     if not acts:
         st.info("Aucun signal : pas de position actuelle ni de cible.")
-        return
-    adf = pd.DataFrame(acts)
-    adisp = pd.DataFrame({
-        "Action": adf["action"],
-        "Marché": adf["marché"].astype(str).str.replace("Elon Musk # tweets ", "", regex=False).str[:26],
-        "Tranche": adf["tranche"], "Côté": adf["côté"],
-        "Actuel": adf["valeur_actuelle"], "Cible": adf["cible"],
-        "Edge": adf["edge"], "Pourquoi": adf["raison"],
-    })
+    else:
+        st.caption("🔴 Sortir · 🟠 Alléger · 🟢 Entrer · 🔵 Renforcer · ✅ Conserver. "
+                   "**Prix** et **Proba modèle** sont du côté recommandé (OUI/NON). Clique **Ouvrir ↗** "
+                   "pour passer l'ordre sur Polymarket. Regroupé par marché (durée indiquée).")
+        # group by market (slug), ordered by duration then closing date -> 2-day & 7-day separated
+        def _order_key(slug):
+            m = meta_by_slug.get(slug, {})
+            return (m.get("dur_days") or 99, str(m.get("window_end") or ""))
+        slugs = sorted({a.get("slug") for a in acts if a.get("slug")}, key=_order_key)
+        no_slug = [a for a in acts if not a.get("slug")]
+        for slug in slugs:
+            g = [a for a in acts if a.get("slug") == slug]
+            m = meta_by_slug.get(slug, {})
+            title = _clean(g[0]["marché"] or slug)
+            dur = m.get("dur_days") or g[0].get("dur_days")
+            dur_lbl = f"⏱ {dur:.0f} j" if dur else ""
+            url = STR.polymarket_url(slug)
+            st.markdown(f"**{title}** &nbsp; {dur_lbl} &nbsp;·&nbsp; [↗ Ouvrir sur Polymarket]({url})")
+            gdf = pd.DataFrame([{
+                "Action": a["action"], "Tranche": a["tranche"], "Côté": a["côté"],
+                "Prix": (f"{a['prix']:.2f}" if a.get("prix") is not None else "—"),
+                "Proba modèle": (f"{a['proba_modèle']:.0%}" if a.get("proba_modèle") is not None else "—"),
+                "Edge": (f"{a['edge']:+.1%}" if a.get("edge") is not None else "—"),
+                "Actuel": f"${a['valeur_actuelle']:,.0f}", "Cible": f"${a['cible']:,.0f}",
+                "Pourquoi": a["raison"], "Polymarket": a.get("lien") or "",
+            } for a in g])
+            st.dataframe(gdf, use_container_width=True, hide_index=True,
+                         column_config={"Polymarket": st.column_config.LinkColumn(
+                             "Ordre", display_text="Ouvrir ↗")})
+        if no_slug:
+            st.caption(f"({len(no_slug)} action·s sans marché identifié, ignorées de l'affichage groupé.)")
 
-    def _hl_act(row):
-        a = str(row["Action"])
-        col = {"🔴": "rgba(220,0,0,0.16)", "🟠": "rgba(230,150,0,0.16)",
-               "🟢": "rgba(0,170,0,0.16)", "🔵": "rgba(80,140,230,0.16)"}.get(a[:1], "")
-        return [f"background-color: {col}" if col else ""] * len(row)
-
-    st.dataframe(
-        adisp.style.format({"Actuel": "${:,.0f}", "Cible": "${:,.0f}", "Edge": "{:+.1%}"},
-                           na_rep="—").apply(_hl_act, axis=1),
-        use_container_width=True, hide_index=True, height=min(560, 40 * (len(adisp) + 1)))
-    st.caption("🔴 Sortir (le modèle n'y voit plus de valeur) · 🟠 Alléger (au-dessus de la cible) · "
-               "🟢 Entrer (nouvelle opportunité) · 🔵 Renforcer (sous la cible) · ✅ Conserver.")
-
-
-page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions", "🎯 Stratégie"], index=0)
-if page == "💼 Mes positions":
-    render_positions_page()
-    st.stop()
-if page == "🎯 Stratégie":
-    render_strategy_page()
-    st.stop()
-
-st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
-st.caption(
-    "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
-    "(bursts) + Monte-Carlo de la fin de semaine. Données: xtracker.polymarket.com (source "
-    "de résolution) + Gamma API (tranches & prix live)."
-)
+    # ---- Performance tracking on current positions ----
+    st.markdown("### 📊 Suivi de ma performance")
+    psum = posres["summary"]
+    if not cur:
+        st.info("Aucune position Elon ouverte sur ce wallet pour l'instant.")
+    else:
+        mise = psum["mise_totale"]
+        pnl = psum["pnl_total"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Positions", psum["n_positions"])
+        c2.metric("Mise totale (entrée)", f"${mise:,.0f}")
+        c3.metric("Valeur actuelle", f"${psum['valeur_actuelle']:,.0f}")
+        c4.metric("P&L total", f"${pnl:,.0f}",
+                  delta=(f"{pnl/mise:+.1%}" if mise > 0 else None))
+        pdf = pd.DataFrame(cur)
+        perf = pd.DataFrame({
+            "Marché": pdf["marché"].map(_clean), "Tranche": pdf["tranche"], "Côté": pdf["côté"],
+            "Prix entrée": pdf["prix_entrée"].map(lambda x: f"{x:.2f}"),
+            "Prix marché": pdf["prix_marché"].map(lambda x: f"{x:.2f}"),
+            "Mise": pdf["mise"].map(lambda x: f"${x:,.0f}"),
+            "Valeur": pdf["valeur_actuelle"].map(lambda x: f"${x:,.0f}"),
+            "P&L": pdf["pnl"].map(lambda x: f"${x:,.0f}"),
+            "Rendement": (pdf["pnl"] / pdf["mise"].replace(0, np.nan)).map(
+                lambda x: f"{x:+.0%}" if pd.notna(x) else "—"),
+            "Proba modèle (côté)": pdf["proba_modèle_côté"].map(
+                lambda x: f"{x:.0%}" if pd.notna(x) else "—"),
+            "Statut": pdf["statut"],
+            "Polymarket": pdf["slug"].map(STR.polymarket_url),
+        }).sort_values("P&L", ascending=False)
+        st.dataframe(perf, use_container_width=True, hide_index=True,
+                     column_config={"Polymarket": st.column_config.LinkColumn(
+                         "Marché ↗", display_text="Ouvrir ↗")},
+                     height=min(560, 40 * (len(perf) + 1)))
+        st.caption("**Prix entrée** = ton prix d'achat moyen. **P&L** et **Rendement** = gain/perte "
+                   "latent vs ta mise. **Statut** : ✅ Aligné (le modèle te donne encore un edge) · "
+                   "⚠️ Réajuster (le modèle est passé sous ton prix) · ≈ Neutre.")
 
 
 # --------------------------------------------------------------------------- #
-@st.cache_data(show_spinner=False, ttl=900)
+# Cached heavy computations (defined here, above the page dispatch, so the global "Actualiser tout"
+# button can pre-warm EVERY page's cache in one click — not just the page currently displayed).
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, ttl=None)
 def market_duration(slug: str, handle: str) -> float:
     m = D.get_market(slug)
     ws, we = D.resolve_window(slug, m, handle)
     return (we - ws).total_seconds() / 86400.0
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=None)
 def list_active_markets(handle: str) -> list[dict]:
     """Open markets, sorted by close date (soonest first), with readable labels."""
     now = dt.datetime.now(dt.timezone.utc)
@@ -295,7 +330,7 @@ def list_active_markets(handle: str) -> list[dict]:
     return sorted(out, key=lambda m: m["end"])  # closest close first
 
 
-@st.cache_data(show_spinner=True, ttl=600)
+@st.cache_data(show_spinner=True, ttl=None)
 def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
                half_life: float, fit_days: float, gamma: float | None,
                refresh_token: int = 0, calib_token: int = 0) -> dict:
@@ -327,6 +362,71 @@ def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
         "mean_level": run.fit.intensity.mean_level,
         "weekly_totals": run.fit.intensity.weekly_totals,
     }
+
+
+# Default params (mirror the sidebar widget defaults) used to pre-warm each page on a manual refresh.
+_DEFAULT_HANDLE = "elonmusk"
+
+
+def _prewarm_all() -> None:
+    """Eagerly compute every page's heavy data so navigation is instant after « Actualiser tout ».
+
+    Pre-warms with the default params / first active market / saved wallet. If you later change a
+    param (different market, sliders…), only that specific config recomputes once."""
+    handle = _DEFAULT_HANDLE
+    calib = st.session_state.get("calib_token", 0)
+    try:  # market page — first active market, default params
+        mkts = list_active_markets(handle)
+        if mkts:
+            cached_run(mkts[0]["slug"], handle, None, 20000, 28, 90, None, 0, calib)
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # strategy page — default params
+        cached_strategy(1000.0, 0.25, 0.04, 1.2, 0, 0.40, calib)
+    except Exception:  # noqa: BLE001
+        pass
+    try:  # positions page — saved wallet
+        w = POS.load_wallet()
+        if w:
+            cached_positions(w, 12000, st.session_state.get("pos_token", 0))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions", "🎯 Stratégie"], index=0)
+
+# ---- Refresh manuel global : pré-calcule TOUTES les pages d'un coup, puis on navigue librement
+# (les caches restent en mémoire — ttl=None — jusqu'au prochain clic). ----
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Actualiser tout", use_container_width=True, type="primary",
+                     help="Recharge les données et recalcule les 3 pages maintenant. Ensuite, "
+                          "navigue entre les pages sans aucun temps de chargement."):
+    st.cache_data.clear()
+    st.session_state.calib_token = st.session_state.get("calib_token", 0) + 1
+    with st.spinner("Actualisation et pré-calcul de toutes les pages…"):
+        _prewarm_all()
+    st.session_state.last_refresh = dt.datetime.now()
+    st.rerun()
+_lr = st.session_state.get("last_refresh")
+st.sidebar.caption(
+    f"🟢 Tout en cache — actualisé à {_lr.strftime('%H:%M:%S')}. Navigue sans rechargement."
+    if _lr else
+    "Au premier lancement, clique « Actualiser tout » : les 3 pages se calculent une fois, "
+    "puis la navigation est instantanée.")
+
+if page == "💼 Mes positions":
+    render_positions_page()
+    st.stop()
+if page == "🎯 Stratégie":
+    render_strategy_page()
+    st.stop()
+
+st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
+st.caption(
+    "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
+    "(bursts) + Monte-Carlo de la fin de semaine. Données: xtracker.polymarket.com (source "
+    "de résolution) + Gamma API (tranches & prix live)."
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -409,10 +509,6 @@ if live:
                                         format_func=lambda x: f"{x}s")
     tick = st_autorefresh(interval=interval * 1000, key="live_tick")
     refresh_token = int(tick)  # changes each tick -> busts cached_run -> fresh pull + recompute
-
-if st.sidebar.button("🔄 Rafraîchir les données"):
-    cached_run.clear()
-    list_active_markets.clear()
 
 # --------------------------------------------------------------------------- #
 # Run

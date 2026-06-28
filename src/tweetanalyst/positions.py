@@ -164,6 +164,7 @@ def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None 
 
     return {
         "marché": market_title or p.get("eventSlug", ""),
+        "slug": p.get("eventSlug", ""),
         "tranche": _label_from_title(p.get("title", "")),
         "côté": side,
         "parts": size,

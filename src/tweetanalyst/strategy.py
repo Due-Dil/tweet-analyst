@@ -26,6 +26,11 @@ from . import pipeline as P
 _SIDE_FR = {"YES": "OUI", "NO": "NON"}
 
 
+def polymarket_url(slug: str | None) -> str:
+    """Public Polymarket event page for a slug (where the user places orders)."""
+    return f"https://polymarket.com/event/{slug}" if slug else ""
+
+
 def propose(
     bankroll: float = 1000.0,
     kelly_fraction: float = 0.25,
@@ -69,8 +74,11 @@ def propose(
         bracket_width = float(np.median(widths)) if widths else 20.0
         sigma_ratio = float(run.forecast.samples.std()) / bracket_width
         n_obs = run.forecast.n_obs
+        dur_days = total_h / 24.0
         markets_meta.append({"slug": slug, "title": run.market.title, "tau": tau,
-                             "sigma_ratio": sigma_ratio, "n_obs": n_obs, "window_end": run.window_end})
+                             "sigma_ratio": sigma_ratio, "n_obs": n_obs,
+                             "window_start": run.window_start, "window_end": run.window_end,
+                             "dur_days": dur_days})
         if n_obs < min_obs:
             skipped.append({"market": run.market.title,
                             "reason": f"trop peu de tweets observés ({n_obs} < {min_obs}) — pari sur "
@@ -97,6 +105,7 @@ def propose(
                     "slug": slug, "market": run.market.title, "tranche": t["label"], "côté": side,
                     "prix": float(price), "proba_modèle": float(p_side), "edge": float(edge),
                     "kelly_frac": float(f), "tau": tau, "window_end": run.window_end,
+                    "dur_days": total_h / 24.0,
                 })
 
     # ---- allocation: raw fractional-Kelly stakes, then per-market cap, then global bankroll cap ----
@@ -174,7 +183,9 @@ def reconcile(bets: list[dict], current_positions: list[dict],
             act, reason = "✅ Conserver", "proche de la cible"
         actions.append({"marché": b["market"], "tranche": b["tranche"], "côté": b["côté"],
                         "action": act, "valeur_actuelle": cur_stake, "cible": tgt,
-                        "edge": b["edge"], "raison": reason})
+                        "edge": b["edge"], "prix": b.get("prix"), "proba_modèle": b.get("proba_modèle"),
+                        "slug": b.get("slug"), "dur_days": b.get("dur_days"),
+                        "lien": polymarket_url(b.get("slug")), "raison": reason})
     # Held but no longer a target -> exit (model edge gone)
     for k, r in held.items():
         if k in target:
@@ -187,7 +198,9 @@ def reconcile(bets: list[dict], current_positions: list[dict],
         actions.append({"marché": r.get("marché"), "tranche": r.get("tranche"),
                         "côté": _SIDE_FR.get(str(r.get("côté")).upper(), r.get("côté")),
                         "action": "🔴 Sortir", "valeur_actuelle": float(r.get("valeur_actuelle", 0)),
-                        "cible": 0.0, "edge": edge, "raison": reason})
+                        "cible": 0.0, "edge": edge, "prix": r.get("prix_marché"),
+                        "proba_modèle": r.get("proba_modèle_côté"), "slug": r.get("slug"),
+                        "dur_days": None, "lien": polymarket_url(r.get("slug")), "raison": reason})
     order = {"🔴 Sortir": 0, "🟠 Alléger": 1, "🟢 Entrer": 2, "🔵 Renforcer": 3, "✅ Conserver": 4}
     actions.sort(key=lambda a: (order.get(a["action"], 9), -a["valeur_actuelle"]))
     return actions
