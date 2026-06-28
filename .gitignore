@@ -16,3 +16,8 @@ venv/
 
 # OS / editor
 .DS_Store
+
+# Personal wallet address (local only)
+data/wallet.txt
+strategy_backtest_*.csv
+strategy_gate_records.csv

@@ -54,22 +54,25 @@ class IntensityModel:
 
     def sample_level_conditional(
         self, rng: np.random.Generator, n: int,
-        n_obs: int, elapsed_mass: float, prior_strength: float = 1.0,
+        n_obs: int, elapsed_mass: float, prior_strength: float = 0.5,
     ) -> np.ndarray:
-        """Weekly level **updated by the within-window pace so far** (Gamma-Poisson conjugate).
+        """Weekly level shrunk from the empirical prior toward the within-window pace.
 
-        Prior = recent-weeks mean ``mean_level`` worth ``prior_strength`` weeks of pseudo-data.
-        Likelihood: ``n_obs`` counts observed over ``elapsed_mass`` (fraction of the week's seasonal
-        mass already elapsed). Posterior weekly level ~ Gamma(mean_level*b + n_obs, b + elapsed_mass).
-        Early in the week (small elapsed_mass) it stays near the prior; later it follows the realized
-        pace. ``prior_strength`` is the crossover: at elapsed_mass == prior_strength the two weigh equally.
+        Starts from the **bootstrap prior** (``sample_level``), which carries the *true* week-to-week
+        overdispersion (std ≈ 40, not the Poisson √mean ≈ 14 of a naïve Gamma — that under-states the
+        spread and makes the forecast over-confident with little data). Each prior draw is shrunk
+        toward the pace-implied level ``n_obs / elapsed_mass`` with weight ``w = e / (e + prior_strength)``
+        that grows as more of the week's seasonal mass elapses. So at n_obs≈0 the spread stays
+        honestly wide (the forecast is *not* falsely sharp), and late in the window it follows the
+        realized pace. ``prior_strength`` is the crossover (w=½ at elapsed_mass == prior_strength).
         """
+        L_prior = self.sample_level(rng, n)
         e = float(elapsed_mass)
         if e <= 1e-6 or self.mean_level <= 0:
-            return self.sample_level(rng, n)
-        b = float(prior_strength)
-        a = self.mean_level * b
-        return rng.gamma(a + n_obs, 1.0 / (b + e), size=n)
+            return L_prior
+        L_obs = n_obs / e
+        w = e / (e + float(prior_strength))
+        return np.maximum(0.0, (1.0 - w) * L_prior + w * L_obs)
 
 
 def _recency_weights(ages_days: np.ndarray, half_life_days: float) -> np.ndarray:

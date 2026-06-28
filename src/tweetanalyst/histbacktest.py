@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from . import calibration as CAL
 from . import data as D
 from . import model as M
 from . import windows as W
@@ -230,3 +231,100 @@ def run(
                                         hit_rate=("trade_win", "mean")).reset_index()
         g = g.merge(cond, on="tau", how="left")
     return HistBacktest(records=rec, by_tau=g)
+
+
+# --------------------------------------------------------------------------- #
+# Strategy backtest: realized PnL of a fractional-Kelly plan at historical prices
+# --------------------------------------------------------------------------- #
+def strategy_backtest(
+    posts: pd.DataFrame,
+    anchor_end: dt.datetime,
+    n_weeks: int = 16,
+    taus: tuple[float, ...] = (0.4, 0.6, 0.8, 0.92),
+    kelly_fraction: float = 0.25,
+    edge_threshold: float = 0.04,
+    bankroll: float = 1000.0,
+    max_per_market_frac: float = 0.5,
+    n_sims: int = 3000,
+    seed: int = 13,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Replay the fractional-Kelly strategy on resolved markets at real historical prices.
+
+    At each (market, τ): fit the model, read each bracket's real YES price at τ (NO = 1−YES), size
+    bets by ¼-Kelly with the per-market cap, then settle on the realized outcome. Returns
+    (records per market×τ, aggregated-by-τ ROI/hit-rate)."""
+    markets = enumerate_resolved(posts, anchor_end, n_weeks)
+    rng = np.random.default_rng(seed)
+    rows = []
+    for mkt in markets:
+        price_cache = {tok: fetch_prices(tok, mkt.window_start, mkt.window_end)
+                       for (_, _, _, tok) in mkt.brackets}
+        win_idx = next(i for i, (lo, hi, lab, _) in enumerate(mkt.brackets) if lab == mkt.winner) \
+            if mkt.winner else int(np.argmin([abs(mkt.realized - lo) for lo, hi, _, _ in mkt.brackets]))
+        span = W.utc_ts(mkt.window_end) - W.utc_ts(mkt.window_start)
+        dur_days = span.total_seconds() / 86400.0
+        gamma = CAL.gamma_for_duration(dur_days)
+        widths = [hi - lo + 1 for (lo, hi, _, _) in mkt.brackets if np.isfinite(hi)]
+        bracket_width = float(np.median(widths)) if widths else 20.0
+        for tau in taus:
+            now = (W.utc_ts(mkt.window_start) + span * tau).to_pydatetime()
+            fit = M.fit_model(posts, now)
+            fc = M.forecast(fit, mkt.window_start, mkt.window_end, n_sims=n_sims, rng=rng)
+            tbl = M.bracket_probabilities(
+                [D.Bracket(lab, lo, hi, None) for (lo, hi, lab, _) in mkt.brackets],
+                fc.samples, gamma=gamma)
+            yes_prices = market_probs_at(mkt, now, price_cache)  # raw forward-filled YES price/bracket
+
+            cands = []
+            for i in range(len(mkt.brackets)):
+                p_in = tbl[i]["model_prob"]
+                yq = float(yes_prices[i])
+                for side, price, p_side in (("OUI", yq, p_in), ("NON", 1.0 - yq, 1.0 - p_in)):
+                    if price <= 0.0 or price >= 1.0:
+                        continue
+                    edge = p_side - price
+                    if edge <= edge_threshold:
+                        continue
+                    f = kelly_fraction * edge / (1.0 - price)
+                    cands.append({"i": i, "side": side, "price": price, "stake": bankroll * f})
+            cap = bankroll * max_per_market_frac
+            tot = sum(c["stake"] for c in cands)
+            if tot > cap and tot > 0:
+                for c in cands:
+                    c["stake"] *= cap / tot
+
+            staked = pnl = 0.0
+            nbet = won = 0
+            for c in cands:
+                if c["stake"] < 0.5:
+                    continue
+                staked += c["stake"]
+                nbet += 1
+                win = (c["side"] == "OUI" and c["i"] == win_idx) or \
+                      (c["side"] == "NON" and c["i"] != win_idx)
+                if win:
+                    pnl += c["stake"] * (1.0 / c["price"] - 1.0)
+                    won += 1
+                else:
+                    pnl -= c["stake"]
+            sigma_ratio = float(fc.samples.std()) / bracket_width  # forecast σ in bracket-widths
+            rows.append({"week_end": mkt.window_end, "tau": tau, "dur_days": round(dur_days, 1),
+                         "hours_remaining": round(fc.hours_remaining, 1),
+                         "sigma_ratio": sigma_ratio,
+                         "staked": staked, "pnl": pnl,
+                         "roi": (pnl / staked) if staked > 0 else 0.0,
+                         "n_bets": nbet, "hit_rate": (won / nbet) if nbet else float("nan")})
+
+    rec = pd.DataFrame(rows)
+    if rec.empty:
+        return rec, rec
+    g = rec.groupby("tau").apply(lambda d: pd.Series({
+        "n_market_weeks": len(d),
+        "avg_bets": d["n_bets"].mean(),
+        "total_staked": d["staked"].sum(),
+        "total_pnl": d["pnl"].sum(),
+        "roi_aggregate": d["pnl"].sum() / d["staked"].sum() if d["staked"].sum() > 0 else 0.0,
+        "roi_mean_per_week": d.loc[d["staked"] > 0, "roi"].mean(),
+        "hit_rate": d["hit_rate"].mean(),
+    })).reset_index()
+    return rec, g
