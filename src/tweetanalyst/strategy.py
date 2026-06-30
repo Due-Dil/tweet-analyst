@@ -181,7 +181,11 @@ def propose(
         markets_meta.append({"slug": slug, "title": run.market.title, "tau": tau,
                              "sigma_ratio": sigma_ratio, "n_obs": n_obs,
                              "window_start": run.window_start, "window_end": run.window_end,
-                             "dur_days": dur_days})
+                             "dur_days": dur_days,
+                             # per-bracket model probs + prices, so the app can compute value-at-risk
+                             "brackets": [{"label": t["label"], "model_prob": t["model_prob"],
+                                           "yes_price": t.get("yes_price"),
+                                           "no_price": t.get("no_price")} for t in run.table]})
         if n_obs < min_obs:
             skipped.append({"market": run.market.title,
                             "reason": f"trop peu de tweets observés ({n_obs} < {min_obs}) — pari sur "
@@ -302,21 +306,106 @@ def reconcile(bets: list[dict], current_positions: list[dict],
                         "edge": b["edge"], "prix": b.get("prix"), "proba_modèle": b.get("proba_modèle"),
                         "slug": b.get("slug"), "dur_days": b.get("dur_days"),
                         "lien": polymarket_url(b.get("slug")), "raison": reason})
-    # Held but no longer a target -> exit (model edge gone)
+    # Held but not in the target portfolio. EXIT only if the model edge on the held side has actually
+    # turned negative (the validated rule: cut on negative edge, hold winners). A still-positive-edge
+    # position is often just a slightly sub-optimal expression of a view the joint portfolio already
+    # covers via another bracket/side (e.g. holding "<40 YES" when the optimum is the equivalent
+    # "40-64 NO") — selling it would only churn spread, so KEEP it.
     for k, r in held.items():
         if k in target:
             continue
         edge = r.get("edge_côté")
         if edge is not None and edge < 0:
+            act = "🔴 Sortir"
             reason = f"edge négatif ({edge:.0%}) — le modèle n'y voit plus de valeur"
         else:
-            reason = "plus dans le portefeuille-cible (edge sous le seuil)"
+            act = "✅ Conserver"
+            reason = ("edge encore positif — hors portefeuille-cible (même vue déjà couverte via une "
+                      "autre tranche), mais le modèle reste favorable : garder")
         actions.append({"marché": r.get("marché"), "tranche": r.get("tranche"),
                         "côté": _SIDE_FR.get(str(r.get("côté")).upper(), r.get("côté")),
-                        "action": "🔴 Sortir", "valeur_actuelle": float(r.get("valeur_actuelle", 0)),
+                        "action": act, "valeur_actuelle": float(r.get("valeur_actuelle", 0)),
                         "cible": 0.0, "edge": edge, "prix": r.get("prix_marché"),
                         "proba_modèle": r.get("proba_modèle_côté"), "slug": r.get("slug"),
                         "dur_days": None, "lien": polymarket_url(r.get("slug")), "raison": reason})
     order = {"🔴 Sortir": 0, "🟠 Alléger": 1, "🟢 Entrer": 2, "🔵 Renforcer": 3, "✅ Conserver": 4}
     actions.sort(key=lambda a: (order.get(a["action"], 9), -a["valeur_actuelle"]))
     return actions
+
+
+# --------------------------------------------------------------------------- #
+# Value-at-risk on a holding set (current positions OR the strategy's target)
+# --------------------------------------------------------------------------- #
+def _norm_label(s: str) -> str:
+    return str(s).strip().replace("–", "-").replace("—", "-")
+
+
+def portfolio_risk(holdings: list[dict], brackets_by_slug: dict[str, list[dict]],
+                   n_mc: int = 20000, seed: int = 7) -> dict:
+    """How much a set of holdings can lose, per market and in total.
+
+    Each market resolves to ONE winning bracket, so a holding's payoff is discrete. Using the model's
+    bracket probabilities we get the P&L distribution and report, per market: ``max_loss`` (a losing
+    bracket wins — the worst case), ``var95_loss`` (loss not exceeded with 95% model-probability) and
+    ``expected_pnl``. The total combines markets by Monte-Carlo (they're independent), giving an
+    honest 90% P&L interval [p5, p95] rather than a naive sum of worst cases.
+
+    ``holdings``: dicts ``{slug, tranche, side, value, payoff}`` — ``side`` ∈ {OUI,NON,YES,NO},
+    ``value`` = capital engaged now (current value, or stake for a target), ``payoff`` = $ received if
+    that leg wins (= shares). ``brackets_by_slug``: ``{slug: [{label, model_prob}, ...]}``."""
+    import numpy as np
+
+    by_slug: dict[str, list[dict]] = defaultdict(list)
+    for h in holdings:
+        by_slug[h["slug"]].append(h)
+
+    per, dists = [], []
+    for slug, hs in by_slug.items():
+        value_total = float(sum(h["value"] for h in hs))
+        bks = brackets_by_slug.get(slug)
+        if not bks:
+            per.append({"slug": slug, "value": value_total, "max_loss": value_total,
+                        "var95_loss": value_total, "expected_pnl": float("nan"), "known": False})
+            continue
+        labels = [_norm_label(b["label"]) for b in bks]
+        probs = np.array([max(float(b.get("model_prob", 0.0)), 0.0) for b in bks])
+        probs = probs / probs.sum() if probs.sum() > 0 else np.ones(len(bks)) / len(bks)
+        finals = np.zeros(len(bks))
+        for j in range(len(bks)):
+            fv = 0.0
+            for h in hs:
+                is_yes = str(h["side"]).upper() in ("OUI", "YES")
+                win = (_norm_label(h["tranche"]) == labels[j]) if is_yes \
+                    else (_norm_label(h["tranche"]) != labels[j])
+                if win:
+                    fv += float(h["payoff"])
+            finals[j] = fv
+        pnls = finals - value_total
+        order = np.argsort(pnls)
+        cum = np.cumsum(probs[order])
+        k_lo = min(int(np.searchsorted(cum, 0.05)), len(order) - 1)
+        k_hi = min(int(np.searchsorted(cum, 0.95)), len(order) - 1)
+        per.append({"slug": slug, "value": value_total,
+                    "max_loss": float(value_total - finals.min()),
+                    "max_gain": float(finals.max() - value_total),
+                    "var95_loss": float(max(0.0, -pnls[order][k_lo])),
+                    "var95_gain": float(max(0.0, pnls[order][k_hi])),
+                    "expected_pnl": float((probs * pnls).sum()), "known": True})
+        dists.append((pnls, probs))
+
+    rng = np.random.default_rng(seed)
+    total_value = float(sum(p["value"] for p in per))
+    if dists:
+        sims = np.zeros(n_mc)
+        for pnls, probs in dists:
+            sims += pnls[rng.choice(len(pnls), size=n_mc, p=probs)]
+        total = {"value": total_value, "expected_pnl": float(sims.mean()),
+                 "max_loss": float(sum(p["max_loss"] for p in per if p["known"])),
+                 "max_gain": float(sum(p["max_gain"] for p in per if p["known"])),
+                 "var95_loss": float(max(0.0, -np.percentile(sims, 5))),
+                 "var95_gain": float(max(0.0, np.percentile(sims, 95))),
+                 "p5": float(np.percentile(sims, 5)), "p95": float(np.percentile(sims, 95))}
+    else:
+        total = {"value": total_value, "expected_pnl": float("nan"), "max_loss": total_value,
+                 "max_gain": 0.0, "var95_loss": total_value, "var95_gain": 0.0, "p5": 0.0, "p95": 0.0}
+    return {"per_market": per, "total": total}

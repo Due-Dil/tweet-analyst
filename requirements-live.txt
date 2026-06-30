@@ -1,0 +1,6 @@
+# Phase 2 (live feed + sell execution) — install ONLY when activating:
+#   pip install -r requirements-live.txt
+# The base app runs without these (imports are lazy and guarded).
+
+keyring>=24            # secure secret storage in the OS keychain
+py-clob-client>=0.17   # Polymarket CLOB order signing/placement (sells)

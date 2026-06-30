@@ -138,6 +138,81 @@ def get_executor(live: bool = False) -> Executor:
 
 
 # --------------------------------------------------------------------------- #
+# Auto-sell engine: turn the strategy's signals into sell orders
+# --------------------------------------------------------------------------- #
+def _norm_side(s: str) -> str:
+    return {"OUI": "OUI", "NON": "NON", "YES": "OUI", "NO": "NON"}.get(str(s).upper(), str(s).upper())
+
+
+def build_sell_orders(actions: list[dict], positions: list[dict],
+                      slippage: float = 0.02, max_orders: int = 20) -> list[OrderIntent]:
+    """Translate reconcile() signals into SELL ``OrderIntent``s. Only **Sortir** (exit fully) and
+    **Alléger** (trim down to the Kelly target) produce orders — entries/reinforcements are buys and
+    are intentionally never executed here. Shares & token id come from the matched wallet position;
+    the limit price is the current price minus a ``slippage`` cushion (a floor on the fill)."""
+    idx = {(r.get("slug"), str(r.get("tranche")).strip(), _norm_side(r.get("côté"))): r
+           for r in positions}
+    orders: list[OrderIntent] = []
+    for a in actions:
+        act = str(a.get("action", ""))
+        is_exit, is_trim = ("Sortir" in act), ("Alléger" in act)
+        if not (is_exit or is_trim):
+            continue
+        r = idx.get((a.get("slug"), str(a.get("tranche")).strip(), _norm_side(a.get("côté"))))
+        if not r:
+            continue
+        token = r.get("token_id")
+        shares = float(r.get("parts", 0) or 0)
+        price = float(r.get("prix_marché", 0) or 0)
+        if not token or shares <= 0 or not (0.0 < price < 1.0):
+            continue
+        if is_exit:
+            sell_shares = shares
+        else:  # trim to target
+            sell_value = max(0.0, float(a.get("valeur_actuelle", 0)) - float(a.get("cible", 0)))
+            sell_shares = min(shares, sell_value / price)
+        if sell_shares < 1e-4:
+            continue
+        orders.append(OrderIntent(
+            market_slug=a.get("slug") or "", bracket_label=str(a.get("tranche")),
+            token_id=str(token), shares=round(sell_shares, 2),
+            limit_price=max(round(price * (1.0 - slippage), 3), 0.01),
+            reason=f"{act.strip()} — {a.get('raison', '')}"))
+        if len(orders) >= max_orders:
+            break
+    return orders
+
+
+def run_autosell(
+    wallet: str | None = None, bankroll: float = 1000.0, kelly_fraction: float = 0.25,
+    edge_threshold: float = 0.04, max_sigma_ratio: float = 1.2, max_per_market_frac: float = 0.40,
+    sizing: str = "joint", handle: str = "elonmusk", now=None, n_sims: int = 8000,
+    slippage: float = 0.02, max_orders: int = 20, live: bool = False, confirm: bool = False,
+) -> dict:
+    """End-to-end: build the strategy, diff it against the wallet, and (dry-run by default) place the
+    resulting SELL orders. Returns {orders, results, executor, live}. **Dry-run unless** ``live=True``
+    AND ``EXECUTION_ENABLED`` AND ``confirm=True`` — so this is safe to call to *preview* what it would
+    sell. Designed to be triggered by a user action (button / explicit live tick), not a hidden loop."""
+    from . import positions as POS   # lazy (avoid import cycles)
+    from . import strategy as STR
+
+    wallet = wallet or POS.load_wallet()
+    if not wallet:
+        return {"orders": [], "results": [], "executor": None, "live": False,
+                "error": "aucun wallet configuré"}
+    res = STR.propose(bankroll=bankroll, kelly_fraction=kelly_fraction, edge_threshold=edge_threshold,
+                      max_sigma_ratio=max_sigma_ratio, max_per_market_frac=max_per_market_frac,
+                      sizing=sizing, handle=handle, now=now, n_sims=n_sims)
+    cur = POS.analyze(wallet, n_sims=n_sims, now=now)["positions"]
+    actions = STR.reconcile(res["bets"], cur)
+    orders = build_sell_orders(actions, cur, slippage=slippage, max_orders=max_orders)
+    ex = get_executor(live=live)
+    results = [ex.submit(o, confirm=confirm) for o in orders]
+    return {"orders": orders, "results": results, "executor": type(ex).__name__,
+            "live": bool(live and EXECUTION_ENABLED and confirm)}
+
+
+# --------------------------------------------------------------------------- #
 # Secret storage (OS keychain via `keyring`; lazy)
 # --------------------------------------------------------------------------- #
 def store_private_key(private_key: str, account: str = "default") -> None:

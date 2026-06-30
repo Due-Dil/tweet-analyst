@@ -19,6 +19,7 @@ import requests
 
 XTRACKER_API = "https://xtracker.polymarket.com/api"
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 DEFAULT_HANDLE = "elonmusk"
 
 _CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "cache.db"
@@ -240,33 +241,77 @@ def _parse_bracket_bounds(label: str) -> tuple[float, float]:
     return (float(lo), float(hi))
 
 
+def _fetch_midpoints(tokens: list) -> dict:
+    """Live order-book midpoints from the CLOB (one batched call) -> {token_id: price}.
+
+    This is the price Polymarket actually shows/trades on. Gamma's ``outcomePrices`` can lag the live
+    book, so we use this as the source of truth and fall back to Gamma only when a token is missing
+    (illiquid / no book). Returns {} on any failure (callers fall back to Gamma)."""
+    toks = [t for t in tokens if t]
+    if not toks:
+        return {}
+    try:
+        r = requests.post(f"{CLOB_API}/midpoints", json=[{"token_id": t} for t in toks],
+                          headers=_UA, timeout=20)
+        if r.status_code != 200:
+            return {}
+        out = {}
+        for k, v in (r.json().items() if isinstance(r.json(), dict) else []):
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def get_market(slug: str) -> MarketEvent:
+    import json
+
     data = _http_get(f"{GAMMA_API}/events", {"slug": slug})
     if not data:
         raise ValueError(f"No Polymarket event for slug={slug!r}")
     e = data[0]
-    brackets: list[Bracket] = []
+    # First pass: parse brackets + identify the YES/NO CLOB tokens and the Gamma price fallbacks.
+    parsed, all_tokens = [], []
     for m in e.get("markets", []):
         label = m.get("groupItemTitle") or m.get("question", "")
         lo, hi = _parse_bracket_bounds(label)
-        yes_price = None
-        prices = m.get("outcomePrices")
+        toks = m.get("clobTokenIds")
         outcomes = m.get("outcomes")
-        if isinstance(prices, str):
-            import json
+        prices = m.get("outcomePrices")
+        toks = json.loads(toks) if isinstance(toks, str) else toks
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+        yes_tok = no_tok = g_yes = g_no = None
+        if outcomes:
+            low = [str(o).lower() for o in outcomes]
+            yi = low.index("yes") if "yes" in low else 0
+            ni = low.index("no") if "no" in low else (1 if len(low) > 1 else None)
+            if toks:
+                yes_tok = toks[yi] if yi < len(toks) else None
+                no_tok = toks[ni] if (ni is not None and ni < len(toks)) else None
+            if prices:
+                try:
+                    g_yes = float(prices[yi])
+                except (TypeError, ValueError, IndexError):
+                    pass
+                try:
+                    g_no = float(prices[ni]) if ni is not None else None
+                except (TypeError, ValueError, IndexError):
+                    pass
+        parsed.append((label, lo, hi, yes_tok, no_tok, g_yes, g_no))
+        all_tokens += [yes_tok, no_tok]
 
-            prices = json.loads(prices)
-            outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-        no_price = None
-        if prices and outcomes:
-            try:
-                yi = [o.lower() for o in outcomes].index("yes")
-                ni = [o.lower() for o in outcomes].index("no")
-                yes_price = float(prices[yi])
-                no_price = float(prices[ni])
-            except (ValueError, TypeError):
-                yes_price = float(prices[0])
-                no_price = float(prices[1]) if len(prices) > 1 else None
+    # Second pass: live CLOB midpoints (source of truth), Gamma as fallback.
+    mids = _fetch_midpoints(all_tokens)
+    brackets: list[Bracket] = []
+    for (label, lo, hi, yes_tok, no_tok, g_yes, g_no) in parsed:
+        yes_price = mids.get(yes_tok, g_yes) if yes_tok else g_yes
+        no_price = mids.get(no_tok) if no_tok else None
+        if no_price is None:
+            no_price = g_no if g_no is not None else (None if yes_price is None else 1.0 - yes_price)
         brackets.append(Bracket(label=label, low=lo, high=hi, yes_price=yes_price, no_price=no_price))
     brackets.sort(key=lambda b: b.low)
     return MarketEvent(
