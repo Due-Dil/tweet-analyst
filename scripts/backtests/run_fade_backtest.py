@@ -4,6 +4,8 @@
 """
 import sys, warnings, datetime as dt, time
 warnings.filterwarnings("ignore")
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 import pandas as pd
 from tweetanalyst import data as D, crowd as C
@@ -28,7 +30,7 @@ for jmp in (0.06, 0.10, 0.15):
         rows.append(s)
 
 res = pd.DataFrame(rows)
-res.to_csv("fade_backtest.csv", index=False)
+res.to_csv("backtest_data/crowd/fade_backtest.csv", index=False)
 print(f"\n=== Fade backtest ({time.time()-t0:.0f}s) — ret = rendement par $ misé, net de spread 2c ===")
 cols = ["direction", "burst_only", "jump", "horizon_h", "n_trades", "roi_moyen", "roi_median", "hit_rate"]
 print(res[cols].round(4).to_string(index=False))

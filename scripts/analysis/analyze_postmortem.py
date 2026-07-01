@@ -11,6 +11,8 @@ Saves analysis.csv + postmortem.png + prints a summary. Winner is inferred from 
 even before Gamma flips the resolution flag.
 """
 import sys, json, datetime as dt
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 from pathlib import Path
 

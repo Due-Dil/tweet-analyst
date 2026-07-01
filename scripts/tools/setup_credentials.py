@@ -12,6 +12,8 @@ for Polymarket so the key's blast radius is bounded. Requires `pip install -r re
 import getpass
 import sys
 
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 
 

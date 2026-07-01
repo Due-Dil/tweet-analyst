@@ -9,6 +9,8 @@ bid-ask spread haircut and real CLOB prices. Compares variants and breaks result
 """
 import sys, warnings, datetime as dt, time
 warnings.filterwarnings("ignore")
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 import pandas as pd
 from tweetanalyst import data as D, pathbacktest as PB
@@ -33,10 +35,10 @@ t0 = time.time()
 res = PB.run_path(posts, ANCHOR, durations=durations, step_h=step_h,
                   n_sims=2500, max_markets=max_markets, record_actions=True)
 
-res.records.to_csv("pathbacktest_records.csv", index=False)
-res.by_variant.to_csv("pathbacktest_by_variant.csv", index=False)
-res.by_variant_duration.to_csv("pathbacktest_by_variant_duration.csv", index=False)
-res.actions.to_csv("pathbacktest_actions.csv", index=False)
+res.records.to_csv("backtest_data/path_strategy/pathbacktest_records.csv", index=False)
+res.by_variant.to_csv("backtest_data/path_strategy/pathbacktest_by_variant.csv", index=False)
+res.by_variant_duration.to_csv("backtest_data/path_strategy/pathbacktest_by_variant_duration.csv", index=False)
+res.actions.to_csv("backtest_data/path_strategy/pathbacktest_actions.csv", index=False)
 
 pd.set_option("display.width", 220, "display.max_columns", 30)
 print(f"\n=== PAR VARIANTE (toutes durées)  ({time.time()-t0:.0f}s) ===", flush=True)

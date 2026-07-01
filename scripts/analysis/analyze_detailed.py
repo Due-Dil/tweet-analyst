@@ -11,6 +11,8 @@ Uses the richest snapshot (trajectory + tick trades + posts). Produces:
 Saves detailed CSVs + a multi-panel PNG.
 """
 import sys, json, datetime as dt
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 from pathlib import Path
 

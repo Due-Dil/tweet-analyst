@@ -15,6 +15,8 @@ We run it (a) with the predicted level, (b) level rescaled to the realized count
 and (c) seasonal-only (no Hawkes) — if (a/b) fit and (c) doesn't, the Hawkes burst layer is validated.
 """
 import sys, json, datetime as dt
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 from pathlib import Path
 

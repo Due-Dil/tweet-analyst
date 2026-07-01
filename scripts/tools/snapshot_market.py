@@ -2,7 +2,7 @@
 
     python snapshot_market.py [slug]        # default: the June 27-29 market
 
-Captures, into ``data/postmortem/<slug>/snapshot_<UTC>/``:
+Captures, into ``backtest_data/postmortem/<slug>/snapshot_<UTC>/``:
   * meta.json        — window, brackets, current/closed status, winner (if resolved), realized count
   * posts.csv        — every XTracker post in the counting window (the resolution truth)
   * prices.csv       — full CLOB price history per bracket (1-min fidelity), long format
@@ -13,6 +13,8 @@ Re-run AFTER the close (window end) to get the definitive, resolved snapshot. No
 each run writes a new timestamped folder.
 """
 import sys, json, datetime as dt
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 from pathlib import Path
 

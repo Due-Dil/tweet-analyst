@@ -1,5 +1,7 @@
-# Local data cache (XTracker posts)
+# Local data cache (XTracker posts + CLOB prices + trades + resolved-market metadata)
 data/cache.db
+data/cache.db-shm
+data/cache.db-wal
 
 # Local tooling / editor config
 .claude/
@@ -18,5 +20,3 @@ venv/
 
 # Personal wallet address (local only)
 data/wallet.txt
-strategy_backtest_*.csv
-strategy_gate_records.csv

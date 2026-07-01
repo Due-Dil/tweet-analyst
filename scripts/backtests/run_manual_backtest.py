@@ -15,6 +15,8 @@ Entry pays a manual execution haircut (spread, wider than the automated case). T
 """
 import sys, warnings, datetime as dt, time, dataclasses
 warnings.filterwarnings("ignore")
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 import numpy as np, pandas as pd
 from tweetanalyst import data as D, pathbacktest as PB, model as M, calibration as CAL, windows as W
@@ -122,7 +124,7 @@ for conf in (0.45, 0.55, 0.65, 0.75, 0.85):
                          "tau_moy": float(np.mean([r["tau"] for r in sub]))})
 
 df = pd.DataFrame(rows)
-df.to_csv("manual_backtest.csv", index=False)
+df.to_csv("backtest_data/manual/manual_backtest.csv", index=False)
 pd.set_option("display.width", 200, "display.max_columns", 20)
 print(f"\n=== STRATÉGIE MANUELLE — entrée unique à haute confiance, tenue à la clôture ({time.time()-t0:.0f}s) ===")
 print("spread manuel=3c, ¼-Kelly, σ-gate=1.4. couverture = part des marchés effectivement tradés.")

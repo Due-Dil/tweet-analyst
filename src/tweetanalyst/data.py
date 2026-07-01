@@ -31,7 +31,11 @@ _UA = {"User-Agent": "tweet-analyst/1.0 (+research)"}
 # --------------------------------------------------------------------------- #
 def _conn(path: Path = _CACHE_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path))
+    con = sqlite3.connect(str(path), timeout=30.0)
+    # WAL lets a background archiver write prices while the app reads; busy_timeout waits out any lock
+    # instead of raising "database is locked".
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute(
         """CREATE TABLE IF NOT EXISTS posts (
                platform_id TEXT PRIMARY KEY,

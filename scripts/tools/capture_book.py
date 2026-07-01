@@ -9,6 +9,8 @@ Appends one JSONL line per (token, poll) to data/orderbook/book_<UTCdate>.jsonl:
 Both YES and NO tokens per bracket are captured (NO is quoted independently). Runs for ``duration_h``.
 """
 import sys, time, json, datetime as dt
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 from pathlib import Path
 

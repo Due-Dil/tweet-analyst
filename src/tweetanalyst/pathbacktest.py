@@ -90,14 +90,18 @@ def parse_window(description: str, year_hint: int | None = None) -> tuple[dt.dat
     return None
 
 
-def _series_events(limit: int = 100, max_pages: int = 4) -> list[dict]:
-    """All closed events across every Elon-tweet series (weekly + 48h), newest first."""
+def _series_events(limit: int = 100, max_pages: int = 4, closed: bool = True) -> list[dict]:
+    """Events across every Elon-tweet series (weekly + 48h), newest first.
+
+    ``closed=True`` (default, used by every backtest — needs a resolved ground truth) returns only
+    resolved markets. ``closed=False`` returns the currently open/ongoing markets instead.
+    """
     out: list[dict] = []
     for sid in ELON_SERIES_IDS:
         for page in range(max_pages):
             try:
                 d = requests.get(f"{GAMMA}/events", params={
-                    "series_id": sid, "closed": "true", "limit": limit,
+                    "series_id": sid, "closed": "true" if closed else "false", "limit": limit,
                     "offset": page * limit, "order": "endDate", "ascending": "false"}, timeout=30).json()
             except Exception:  # noqa: BLE001
                 break

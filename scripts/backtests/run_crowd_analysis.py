@@ -4,6 +4,8 @@
 """
 import sys, warnings, datetime as dt, time
 warnings.filterwarnings("ignore")
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 import pandas as pd
 from tweetanalyst import data as D, crowd as C
@@ -16,22 +18,22 @@ print(f"posts: {len(posts)}", flush=True)
 
 t0 = time.time()
 obs = C.collect_observations(posts, ANCHOR, progress=False)
-obs.to_csv("crowd_observations.csv", index=False)
+obs.to_csv("backtest_data/crowd/crowd_observations.csv", index=False)
 print(f"\nobservations (marché×tranche×τ): {len(obs)}  ({time.time()-t0:.0f}s)")
 
 print("\n=== CALIBRATION par phase × bucket de prix (écart = freq_réelle − prix ; <0 = SURCOTÉ) ===")
 cal = C.calibration(obs)
-cal.to_csv("crowd_calibration.csv", index=False)
+cal.to_csv("backtest_data/crowd/crowd_calibration.csv", index=False)
 print(cal.round(3).to_string(index=False))
 
 print("\n=== TAILS vs CENTRE par phase ===")
 ts = C.tail_summary(obs)
-ts.to_csv("crowd_tails.csv", index=False)
+ts.to_csv("backtest_data/crowd/crowd_tails.csv", index=False)
 print(ts.round(3).to_string(index=False))
 
 print("\n=== SURRÉACTION (jump → rendement futur) ===")
 summ, ev = C.overreaction(posts, ANCHOR, progress=False)
-ev.to_csv("crowd_overreaction_events.csv", index=False)
+ev.to_csv("backtest_data/crowd/crowd_overreaction_events.csv", index=False)
 for k, v in summ.items():
     print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 print("\nLecture : reversion_score > 0 ⇒ le prix revient après un saut (surréaction). "
