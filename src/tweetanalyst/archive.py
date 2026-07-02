@@ -92,7 +92,9 @@ def _fetch_token_fine(token: str, t0: dt.datetime, t1: dt.datetime, con,
     the fine series (upgrades an hourly-cached token); (token, t) PK ignores collisions."""
     if token is None:
         return 0
-    start = int(W.utc_ts(t0).timestamp()) - 3600
+    # 48h BEFORE the window open: markets trade pre-open and that history feeds the "<40 pre-open
+    # optionality" play (docs/STRATEGY.md §2bis) — capture it before Polymarket purges it.
+    start = int(W.utc_ts(t0).timestamp()) - 48 * 3600
     end = int(W.utc_ts(t1).timestamp()) + 3600
     try:
         r = requests.get(HB.CLOB, params={"market": token, "startTs": start, "endTs": end,

@@ -82,6 +82,31 @@ Fade tardif : à τ ∈ [0.70, 0.85], acheter **NON** (au vrai prix NON) sur une
 que le modèle dit surpayée de ≥5pts → 77% win, +7,8% ROI/trade. À n'utiliser qu'en complément,
 mise ≤5%, car l'edge est mince après coûts réels.
 
+### 2bis. Le « billet \<40 » — jeu d'optionalité pré-ouverture (validé le 2 juil., 40 marchés)
+
+Découverte issue d'un trade réel de l'utilisateur. La tranche `<40` achetée **avant l'ouverture**
+de la fenêtre (~-30h à -12h, prix moyen 0.11, médian 0.077) n'est PAS sous-évaluée pour la
+*résolution* (elle ne gagne que 10% des cas → tenir = **EV négative −11%**). Mais son
+**optionalité intra-fenêtre est systématiquement sous-payée** : dans le 1er jour, une accalmie
+d'Elon (nuit, pause) fait presque toujours flamber son prix — max J1 ≥ 2× l'achat dans 78% des
+cas, ≥ 3× dans 55%.
+
+**La règle** : acheter `<40` en pré-ouverture **seulement si prix ≤ 0.10** ; poser **immédiatement
+un ordre limite de vente à ~2.5-3× le prix d'achat** ; ne JAMAIS tenir à la clôture (si la limite
+n'est pas touchée, la position se règle presque toujours à 0).
+
+| Cible de vente | Touchée | ROI moyen/trade | ROI médian |
+|---|---|---|---|
+| 2× | 78% | +55% | +100% |
+| **2.5-3×** | **55-62%** | **+56-65%** | **+150-200%** |
+| 4× | 42% | +70% | −100% (loterie) |
+
+Mécanisme : c'est **l'autre face du pattern de sur-réaction de foule** déjà validé (les pics
+mi-prix retombent) — ici on est le *vendeur* dans le pic. Taille : **≤1-2% du bankroll** (petit
+échantillon, un seul régime couvert — avr-juin ; les 4 seules victoires à la clôture datent
+toutes de mai, période calme ; en régime hyper-actif le billet peut coter 0.02 et ne jamais
+spiker). L'archiveur capture désormais 48h de pré-ouverture pour suivre ce pattern dans le temps.
+
 ---
 
 ## 3. Garde-fous & honnêteté intellectuelle
