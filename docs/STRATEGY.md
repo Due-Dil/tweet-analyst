@@ -107,6 +107,22 @@ mi-prix retombent) — ici on est le *vendeur* dans le pic. Taille : **≤1-2% d
 toutes de mai, période calme ; en régime hyper-actif le billet peut coter 0.02 et ne jamais
 spiker). L'archiveur capture désormais 48h de pré-ouverture pour suivre ce pattern dans le temps.
 
+**Scan systématique d'optionalité (2 juil., 2 581 tranches × 140 marchés) — le billet `<40` est
+UNIQUE :**
+- **L'edge exige l'entrée PRÉ-ouverture** : au prix d'ouverture (~30-40% plus cher que la veille),
+  le même trade tombe à EV ≈ 0. Acheter la veille (−30h à −12h), jamais après l'ouverture.
+- **Pas de symétrique en queue haute** : les tranches hautes bon marché (165-189, 115-139…)
+  spikent aussi (36-47% touchent 2×) mais pas assez souvent → EV −13% à −29%. Cause : l'accalmie
+  nocturne est quasi certaine chaque jour (le carburant du `<40`), un burst assez gros pour
+  réveiller les queues hautes ne l'est pas — et le marché price déjà la prime de surge.
+- **Aucun équivalent 7 jours** : toutes les cases du scan 7j sont à EV ≤ 0 (une nuit calme ne
+  change presque rien à la proba d'un total sur 7 jours ; les repricings intra-fenêtre sont trop
+  faibles par rapport au spread sur des tickets à 0.03-0.08).
+- Sensibilité honnête : l'EV moyen du `<40` varie selon la bande de prix d'entrée et la période
+  (+9% à +65% selon l'échantillon) ; la **médiane** à cible 2-2.5× reste robustement positive.
+  Le pattern reste classé "petit billet" (≤1-2%), à re-mesurer quand l'archive pré-ouverture
+  (désormais capturée) aura accumulé quelques mois.
+
 ---
 
 ## 3. Garde-fous & honnêteté intellectuelle
@@ -145,6 +161,16 @@ spiker). L'archiveur capture désormais 48h de pré-ouverture pour suivre ce pat
    inchangé** ; l'information de marché s'intègre au niveau de la couche de décision (filtre
    directionnel 2j, ensemble 7j), pas dans le modèle. Pistes futures non testées : prior horaire
    adaptatif, Hawkes multi-échelles — chantiers lourds, gain incertain.
+
+   **Corollaire — sur-cote de la queue basse (`<40`) : correction testée & REJETÉE (2 juil.)** :
+   le modèle sur-estime `<40` (12,8% vs 6,7% réel ; le marché est juste à 8,4%) car sa queue gauche
+   lisse ignore le plancher comportemental d'Elon (min 27, <40 seulement 5/76 fois) et la
+   quasi-certitude d'un burst sur 48h. Un shrink de la tranche la plus basse (1 paramètre, appris
+   sur le Brier) **paraissait** marcher sur un split unique (+64% ROI, Brier 0,467→0,454) mais
+   **échoue en validation roulante mensuelle** : `s` instable (0,4→0,8→0,6→1,0), gain Brier positif
+   1 mois sur 4, stratégie dégradée (66% vs 75%). Cause : événement rare (7%, n=76) + dépendance au
+   régime → incorrigible avec un paramètre fixe. Le **filtre directionnel** (0 paramètre) neutralise
+   déjà ce défaut de façon robuste. Modèle inchangé, définitivement.
 
 ## 5. Pipeline de données (tout est local, rien n'est re-téléchargé)
 
