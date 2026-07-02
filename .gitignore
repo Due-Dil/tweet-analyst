@@ -18,5 +18,7 @@ venv/
 # OS / editor
 .DS_Store
 
-# Personal wallet address (local only)
+# Personal wallet address, bankroll & sync log (local only)
 data/wallet.txt
+data/bankroll.txt
+data/sync.log

@@ -1249,6 +1249,125 @@ def render_reliability_section(R: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Decision panel — the "leader confirmé" strategy wired live (see docs/STRATEGY.md).
+# 2-day: model prob + directional filter, τ∈[0.55,0.70]. 7-day: ENSEMBLE prob
+# (0.5·model + 0.5·normalized price), τ∈[0.85,0.95], reduced stake.
+# --------------------------------------------------------------------------- #
+_BANKROLL_FILE = Path("data/bankroll.txt")
+
+
+def _load_bankroll() -> float:
+    try:
+        return float(_BANKROLL_FILE.read_text().strip())
+    except Exception:  # noqa: BLE001
+        return 1000.0
+
+
+def _lo_of_label(lab: str) -> float:
+    lab = (lab or "").strip()
+    if lab.startswith("<"):
+        return 0.0
+    if lab.endswith("+"):
+        return float(lab[:-1])
+    try:
+        return float(lab.split("-")[0])
+    except Exception:  # noqa: BLE001
+        return 1e9
+
+
+def render_decision_section(R: dict) -> None:
+    st.markdown("### 🧭 Décision — stratégie « leader confirmé »")
+    if R["summary"]["hours_remaining"] <= 0:
+        st.caption("Marché réglé — plus de décision à prendre.")
+        return
+    dur = R["duration_days"]
+    is2d = dur < 4
+    span = (W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds()
+    tau = float(np.clip((W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / max(span, 1), 0, 1))
+    lo_t, hi_t = (0.55, 0.70) if is2d else (0.85, 0.95)
+
+    tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+    if len(tbl) < 3:
+        st.info("Prix marché indisponibles — décision impossible.")
+        return
+    psum = sum(r["yes_price"] for r in tbl) or 1.0
+    dec = []
+    for r in tbl:
+        q = r["yes_price"] / max(psum, 0.2)
+        dec.append({**r, "p_dec": r["model_prob"] if is2d else 0.5 * r["model_prob"] + 0.5 * q})
+    dec.sort(key=lambda r: -r["p_dec"])
+    lead, second = dec[0], dec[1]
+    mkt_fav = max(dec, key=lambda r: r["yes_price"])
+    edge = lead["p_dec"] - lead["yes_price"]
+    conf_min, edge_min = (0.45, 0.05) if is2d else (0.45, 0.025)
+    plabel = "proba modèle" if is2d else "proba ensemble (½ modèle + ½ prix)"
+
+    gates = [
+        (f"Fenêtre de décision τ∈[{lo_t:.2f}, {hi_t:.2f}]", lo_t <= tau <= hi_t, f"τ = {tau:.2f}"),
+        (f"{plabel} du favori ≥ {conf_min:.0%}", lead["p_dec"] >= conf_min, f"{lead['p_dec']:.0%} ({lead['label']})"),
+        (f"Edge ≥ {edge_min*100:.1f} pts", edge >= edge_min, f"{edge:+.1%}"),
+        ("Prix OUI ≤ 0.80", lead["yes_price"] <= 0.80, f"{lead['yes_price']:.2f}"),
+        ("Direction : favori modèle = ou > favori marché",
+         _lo_of_label(lead["label"]) >= _lo_of_label(mkt_fav["label"]),
+         f"{lead['label']} vs {mkt_fav['label']} (marché)"),
+    ]
+    all_ok = all(ok for _, ok, _ in gates)
+
+    gdf = pd.DataFrame([{"": "✅" if ok else "❌", "Condition": name, "Valeur": val}
+                        for name, ok, val in gates])
+    st.dataframe(gdf, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    bankroll = c1.number_input("Bankroll ($)", min_value=50.0, max_value=1e7,
+                               value=_load_bankroll(), step=100.0, key="dec_bankroll")
+    try:  # persist across sessions
+        if abs(bankroll - _load_bankroll()) > 1e-9:
+            _BANKROLL_FILE.write_text(str(bankroll))
+    except Exception:  # noqa: BLE001
+        pass
+    frac_lab = c2.radio("Mise (protocole : 5% les 20 premiers trades)",
+                        ["5%", "10%"], horizontal=True, key="dec_frac")
+    frac = 0.05 if frac_lab == "5%" or not is2d else 0.10   # 7j = ligne secondaire, 5% max
+
+    if not all_ok:
+        if tau < lo_t:
+            t_open = (W.utc_ts(R["window_start"]) + pd.Timedelta(seconds=span * lo_t))
+            t_et = t_open.tz_convert(W.ET)
+            st.info(f"⏳ **Trop tôt** — la fenêtre de décision ouvre à **{t_et:%a %d %b %H:%M} ET** "
+                    f"(τ={lo_t}). Reviens à ce moment-là ; d'ici là, ne rien faire.")
+        elif tau > hi_t:
+            st.warning("⌛ **Fenêtre de décision passée** — on n'entre plus sur ce marché "
+                       "(entrer tard dégrade fortement l'edge mesuré). Attendre le prochain.")
+        else:
+            failed = " · ".join(name for name, ok, _ in gates if not ok)
+            st.error(f"❌ **PASSER ce marché** — condition(s) non satisfaite(s) : {failed}. "
+                     "Ne pas forcer : ~60% des marchés ne qualifient pas, c'est normal.")
+        return
+
+    # qualified → build the order ticket(s)
+    stake = bankroll * frac
+    if is2d and lead["p_dec"] < 0.75:
+        wtot = lead["p_dec"] + second["p_dec"]
+        legs = [(lead, stake * lead["p_dec"] / wtot), (second, stake * second["p_dec"] / wtot)]
+        mode = f"PANIER TOP-2 (leader à {lead['p_dec']:.0%} < 75% → on assure la tranche n°2)"
+    else:
+        legs = [(lead, stake)]
+        mode = ("TOP-1" if is2d else "TOP-1 (7j, ensemble)") + f" — favori à {lead['p_dec']:.0%}"
+    rows = []
+    for r, amt in legs:
+        pe = min(r["yes_price"] + 0.015, 0.999)
+        rows.append({"Ordre": "ACHETER OUI", "Tranche": r["label"],
+                     "Prix limite ≈": f"{min(r['yes_price'] + 0.01, 0.99):.2f}",
+                     "Montant": f"${amt:,.0f}".replace(",", " "),
+                     "Parts ≈": f"{amt / pe:,.0f}".replace(",", " ")})
+    st.success(f"✅ **ACHETER — {mode}** · mise totale ${stake:,.0f} ({frac:.0%} du bankroll)".replace(",", " "))
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Puis **tenir jusqu'à la résolution** — pas de moyennage, pas de sortie anticipée "
+               "(option : si ta tranche cote ≥0.95 à τ0.90, tu peux vendre pour éliminer le risque "
+               "de bord). Règles et backtests : docs/STRATEGY.md.")
+
+
+# --------------------------------------------------------------------------- #
 # Cached heavy computations (ttl=None → persist across reruns; each page's "🔄 Rafraîchir" button
 # clears ONLY its own cache, so navigating between pages never recomputes).
 # --------------------------------------------------------------------------- #
@@ -1617,6 +1736,7 @@ st.caption(
     "recommandé, après recalibrage γ. Seuls les paris à edge > 3 pts sont surlignés."
 )
 
+render_decision_section(R)
 render_reliability_section(R)
 
 # --------------------------------------------------------------------------- #

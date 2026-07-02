@@ -22,8 +22,9 @@ sys.path.insert(0, "src")
 import numpy as np, pandas as pd
 from tweetanalyst import data as D, pathbacktest as PB, model as M, calibration as CAL, windows as W
 
-ANCHOR = dt.datetime(2026, 6, 30, 12, 0, tzinfo=dt.timezone.utc)
-DURATIONS = (2,)                                   # start with 2-day markets per the request
+ANCHOR = dt.datetime(2026, 7, 2, 0, 0, tzinfo=dt.timezone.utc)
+# duration from CLI: `python run_tau_backtest.py 7` → 7-day markets → tau_backtest_7d.csv
+DURATIONS = (float(sys.argv[1]),) if len(sys.argv) > 1 else (2,)
 TAUS = np.round(np.arange(0.05, 1.0, 0.05), 3)     # ~every 2.4h on a 48h window
 N_SIMS = 3000
 SPREAD = 0.03
@@ -85,7 +86,7 @@ def main():
             print(f"  [{mi+1}/{len(markets)}] ({time.time()-t0:.0f}s)", flush=True)
 
     df = pd.DataFrame(all_rows)
-    out_path = "backtest_data/tau_backtest_2d.csv"
+    out_path = f"backtest_data/tau_backtest_{int(DURATIONS[0])}d.csv"
     df.to_csv(out_path, index=False)
     print(f"\nsaved: {out_path}  ({len(df)} lignes, {df['slug'].nunique()} marchés, {time.time()-t0:.0f}s)")
 
