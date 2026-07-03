@@ -76,6 +76,16 @@ des surges) et rend l'edge **stable dans le temps** (77% complet → 75% récent
 **Recommandation : 10% flat.** Au-delà, le drawdown croît plus vite que le gain médian et la
 liquidité par tranche (~2M$ de volume par marché mais concentré) devient une contrainte.
 
+### Take-profit : testé et REJETÉ (3 juil., chemins 1-min des 30 trades cœur)
+
+Sortir à +X% de gain au lieu de tenir : **tous les niveaux perdent** (récent : TP+25% → ROI +4%,
+TP+50% → +23%, TP+100% → +24%, vs TENIR +47%). Cause mesurée : les perdants (surges tardifs)
+**ne montent pas avant de mourir** (0/6 n'a touché +100%, 2/6 seulement +25%) — le TP ne sauve
+rien — tandis qu'il cape les gagnants dont le payoff (+120% moyen à l'entrée ~0,45) porte toute
+l'espérance. Le TP monte le % de trades gagnants (83% vs 75%) mais divise l'EV par 2-10 : confort
+émotionnel payé en espérance. Seule sortie anticipée valide : **vendre ≥0,95 à τ≥0,90** (assurance
+bord de tranche à ~5 pts, pas un take-profit).
+
 ### Stratégie d'appoint (optionnelle, petite taille)
 
 Fade tardif : à τ ∈ [0.70, 0.85], acheter **NON** (au vrai prix NON) sur une tranche non-leader
