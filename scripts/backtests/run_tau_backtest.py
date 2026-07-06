@@ -22,7 +22,7 @@ sys.path.insert(0, "src")
 import numpy as np, pandas as pd
 from tweetanalyst import data as D, pathbacktest as PB, model as M, calibration as CAL, windows as W
 
-ANCHOR = dt.datetime(2026, 7, 2, 0, 0, tzinfo=dt.timezone.utc)
+ANCHOR = dt.datetime.now(dt.timezone.utc)  # dynamic → always includes every market resolved so far
 # duration from CLI: `python run_tau_backtest.py 7` → 7-day markets → tau_backtest_7d.csv
 DURATIONS = (float(sys.argv[1]),) if len(sys.argv) > 1 else (2,)
 TAUS = np.round(np.arange(0.05, 1.0, 0.05), 3)     # ~every 2.4h on a 48h window

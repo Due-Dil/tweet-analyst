@@ -1390,12 +1390,14 @@ def list_active_markets(handle: str) -> list[dict]:
                 "slug": D.slug_from_url(tw.market_link),
                 "range": _fmt_range(tw.start, tw.end),
                 "duration": dur,
+                "start": tw.start,
                 "end": tw.end,
             })
     return sorted(out, key=lambda m: m["end"])  # closest close first
 
 
-@st.cache_data(show_spinner=True, ttl=None)
+@st.cache_data(show_spinner="⏳ Recalcul du modèle pour ce marché (fit + simulations + prix live, ~10-30 s)…",
+               ttl=None)
 def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
                half_life: float, fit_days: float, gamma: float | None,
                refresh_token: int = 0, calib_token: int = 0) -> dict:
@@ -1508,31 +1510,54 @@ st.caption(
 st.sidebar.header("Paramètres")
 handle = st.sidebar.text_input("Compte (handle)", value="elonmusk")
 
+# --------------------------------------------------------------------------- #
+# Market picker (main area) — grouped by duration, stable slug-keyed selection
+# --------------------------------------------------------------------------- #
 try:
     markets = list_active_markets(handle)
 except Exception as e:  # noqa: BLE001
     markets = []
-    st.sidebar.warning(f"Marchés actifs indisponibles: {e}")
+    st.warning(f"Marchés actifs indisponibles: {e}")
 
-mode = st.sidebar.radio("Marché", ["Marchés actifs", "URL / slug manuel"], index=0)
-if mode == "Marchés actifs" and markets:
-    _now = dt.datetime.now(dt.timezone.utc)
-    # Select by SLUG (stable identity) with a persistent key — NOT by positional index, so refreshing
-    # / reordering the list (sorted by close date) never remaps the selection to a different market.
-    label_by_slug = {
-        m["slug"]: f"⏳ {_fmt_rel((m['end'] - _now).total_seconds())}  ·  {m['range']}  ·  {m['duration']:.0f}j"
-        for m in markets
-    }
-    slug_options = [m["slug"] for m in markets]
-    slug = st.sidebar.selectbox(
-        "Choisir un marché (clôture la plus proche en premier)", slug_options,
-        format_func=lambda s: label_by_slug.get(s, s), key="sel_market_slug")
+_now = dt.datetime.now(dt.timezone.utc)
+
+
+def _mkt_label(m: dict) -> str:
+    if m["start"] <= _now:
+        state = f"🔴 en cours · clôture dans {_fmt_rel((m['end'] - _now).total_seconds())}"
+    else:
+        state = f"🛒 pré-ouverture · démarre dans {_fmt_rel((m['start'] - _now).total_seconds())}"
+    return f"{m['range']}  ·  {m['duration']:.0f}j  ·  {state}"
+
+
+pc1, pc2 = st.columns([1.1, 3])
+dur_pick = pc1.radio("Durée", ["Tous", "2 jours", "7 jours"], horizontal=True, key="mkt_dur")
+group = [m for m in markets
+         if dur_pick == "Tous" or ((m["duration"] < 4) == (dur_pick == "2 jours"))]
+label_by_slug = {m["slug"]: _mkt_label(m) for m in group}
+slug = None
+if group:
+    opts = [m["slug"] for m in group]
+    # keep the previous selection if it's still in the filtered list; otherwise reset cleanly
+    if st.session_state.get("sel_market_slug") not in opts:
+        st.session_state.pop("sel_market_slug", None)
+    slug = pc2.selectbox("Marché (clôture la plus proche en premier)", opts,
+                         format_func=lambda s: label_by_slug.get(s, s), key="sel_market_slug")
 else:
-    url = st.sidebar.text_input(
-        "URL Polymarket ou slug",
-        value="elon-musk-of-tweets-june-26-july-3",
-    )
-    slug = D.slug_from_url(url)
+    st.info("Aucun marché actif dans cette catégorie.")
+
+with st.expander("✍️ Ou coller une URL / un slug Polymarket (marché ancien, backtest…)"):
+    url = st.text_input("URL ou slug", value="", key="manual_url",
+                        placeholder="https://polymarket.com/event/elon-musk-of-tweets-… ou le slug")
+    if url.strip():
+        slug = D.slug_from_url(url.strip())
+        st.caption(f"→ slug utilisé : `{slug}` (prioritaire sur la liste ci-dessus)")
+
+if not slug:
+    st.stop()
+
+# immediate visual echo of the selection (the model recompute below can take ~10-30 s)
+st.markdown(f"#### 📍 {label_by_slug.get(slug, slug)}")
 
 n_sims = st.sidebar.select_slider(
     "Simulations Monte-Carlo", [4000, 8000, 20000, 40000], value=8000,
@@ -1807,11 +1832,27 @@ st.caption(
 st.markdown("#### Rythme de tweets — intensité par jour × heure (heure ET, pondérée récence)")
 hm = R["heatmap"]  # (7, 24) tweets/hour
 figh = go.Figure(
-    go.Heatmap(z=hm, x=[f"{h:02d}h" for h in range(24)], y=DAYS,
-               colorscale="YlOrRd", colorbar=dict(title="tw/h"))
+    go.Heatmap(z=hm, x=list(range(24)), y=DAYS,
+               colorscale="YlOrRd", colorbar=dict(title="tw/h"),
+               hovertemplate="%{y} %{x}h — %{z:.1f} tw/h<extra></extra>")
 )
-figh.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+# "Maintenant" marker: vertical line at the current ET hour + a box on today's cell
+now_et = W.utc_ts(R["now"]).tz_convert(W.ET)
+et_h = now_et.hour + now_et.minute / 60.0
+et_day = now_et.weekday()  # Mon=0, matches DAYS order
+figh.add_vline(x=et_h, line=dict(color="#00B3B3", width=2, dash="dash"))
+figh.add_annotation(x=et_h, y=1.02, yref="paper", showarrow=False,
+                    text=f"🕐 maintenant · {now_et:%a} {now_et:%H:%M} ET",
+                    font=dict(color="#008C8C", size=12), bgcolor="rgba(255,255,255,0.6)")
+figh.add_shape(type="rect", x0=now_et.hour - 0.5, x1=now_et.hour + 0.5,
+               y0=et_day - 0.5, y1=et_day + 0.5, xref="x", yref="y",
+               line=dict(color="#00B3B3", width=3), fillcolor="rgba(0,0,0,0)")
+figh.update_xaxes(tickmode="array", tickvals=list(range(0, 24, 2)),
+                  ticktext=[f"{h:02d}h" for h in range(0, 24, 2)])
+figh.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(figh, use_container_width=True)
+st.caption(f"Le trait et le cadre 🟦 marquent **l'heure ET actuelle** ({now_et:%A %H:%M}) — "
+           "utile pour lire où on se situe dans le rythme d'Elon (et repérer les creux nocturnes).")
 st.caption(
     f"Hawkes: α={R['alpha']:.2f} (part de tweets déclenchés par 'burst'), "
     f"échelle de burst ≈ {R['burst_h']*60:.0f} min. "

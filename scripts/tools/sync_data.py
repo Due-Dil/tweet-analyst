@@ -18,6 +18,7 @@ import os as _os
 _os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 
+import pandas as pd
 from tweetanalyst import archive as A
 from tweetanalyst import data as D
 
@@ -34,4 +35,19 @@ print(f"marchés: {res['scanned']} scannés · {len(res['new'])} nouveaux archiv
       f"({res['points_added']:,} pts prix, {res['trades_added']:,} trades) · {res['skipped']} déjà en stock")
 if res["new"]:
     print("nouveaux:", ", ".join(res["new"]))
+
+# 3. regenerate the tau-grid CSVs (power the reliability table + Backtest τ page) — only for a
+#    duration that actually gained a resolved market, so we never recompute for nothing.
+import subprocess
+_con = D._conn()
+_arch = pd.read_sql_query("SELECT duration_days FROM resolved_markets", _con)
+_con.close()
+for _dur, _csv in [("2", "backtest_data/tau_backtest_2d.csv"), ("7", "backtest_data/tau_backtest_7d.csv")]:
+    n_arch = int(((_arch["duration_days"] < 4) if _dur == "2" else (_arch["duration_days"] >= 4)).sum())
+    n_csv = pd.read_csv(_csv)["slug"].nunique() if _os.path.exists(_csv) else 0
+    if n_arch > n_csv:
+        print(f"τ-backtest {_dur}j : {n_csv} → {n_arch} marchés, régénération…", flush=True)
+        subprocess.run([sys.executable, "scripts/backtests/run_tau_backtest.py", _dur], check=False)
+    else:
+        print(f"τ-backtest {_dur}j : à jour ({n_csv} marchés)")
 print("OK")
