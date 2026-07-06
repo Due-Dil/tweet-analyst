@@ -1458,6 +1458,122 @@ def _auto_archive_bg(state: dict) -> None:
         state["result"] = {"error": str(e)}
 
 
+# --------------------------------------------------------------------------- #
+# Edge scanner page — every live Elon market (incl. pre-open), every bracket, sorted by edge,
+# annotated with the validated warnings (surge trap, decision window, <40 ticket).
+# --------------------------------------------------------------------------- #
+def render_scanner_page() -> None:
+    st.title("🔎 Scanner d'edges — tous les marchés en ligne")
+    st.caption("Pour chaque marché Elon **ouvert ou pré-ouverture** : proba modèle vs prix live de "
+               "chaque tranche. Filtre par edge minimum. ⚠️ Un gros edge n'est pas toujours une "
+               "opportunité — les pièges connus (backtests) sont annotés sur chaque ligne.")
+    _refresh_button("refresh_scan", cached_run, list_active_markets)
+    token = st.session_state.get("refresh_scan_token", 0)
+
+    try:
+        mkts = list_active_markets("elonmusk")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Marchés actifs indisponibles : {e}")
+        return
+    if not mkts:
+        st.warning("Aucun marché Elon en ligne.")
+        return
+
+    c1, c2 = st.columns([2, 2])
+    edge_min = c1.slider("Edge minimum (points)", 5, 40, 25, key="scan_edge") / 100.0
+    sides = c2.multiselect("Côté", ["OUI (modèle > marché)", "NON (marché surpayé)"],
+                           default=["OUI (modèle > marché)", "NON (marché surpayé)"], key="scan_sides")
+
+    _now = dt.datetime.now(dt.timezone.utc)
+    rows, failed = [], []
+    oldest = None
+    prog = st.progress(0.0, text="Scan des marchés…")
+    for i, m in enumerate(mkts):
+        prog.progress((i + 1) / len(mkts), text=f"Scan {i+1}/{len(mkts)} — {m['range']}")
+        try:
+            R = cached_run(m["slug"], "elonmusk", None, 8000, 28.0, 90.0, None, token,
+                           st.session_state.get("calib_token", 0))
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{m['range']} ({e})")
+            continue
+        r_now = W.utc_ts(R["now"])
+        oldest = r_now if oldest is None else min(oldest, r_now)
+        span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
+        tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
+        pre_open = tau < 0
+        dur = R["duration_days"]
+        state = ("🛒 pré-ouv." if pre_open else f"τ={min(tau,1):.2f}")
+        tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+        if not tbl:
+            continue
+        fav_lo = _lo_of_label(max(tbl, key=lambda r: r["yes_price"])["label"])
+        lowest_lo = min(_lo_of_label(r["label"]) for r in tbl)
+        for r in tbl:
+            e_yes = r["model_prob"] - r["yes_price"]
+            no_px = r.get("no_price") if r.get("no_price") is not None else 1 - r["yes_price"]
+            e_no = (1 - r["model_prob"]) - no_px
+            for side, e, px in [("OUI", e_yes, r["yes_price"]), ("NON", e_no, no_px)]:
+                if e < edge_min:
+                    continue
+                if side == "OUI" and "OUI (modèle > marché)" not in sides:
+                    continue
+                if side == "NON" and "NON (marché surpayé)" not in sides:
+                    continue
+                lo = _lo_of_label(r["label"])
+                warn = ""
+                if side == "OUI" and lo < fav_lo:
+                    warn = "⚠️ PIÈGE : sous le favori marché (surge sous-estimé, ~21% win hist.)"
+                    if lo == lowest_lo and pre_open and px <= 0.12:
+                        warn = "🎟️ billet <40 : jouable en revente 2.5-3×, JAMAIS tenu"
+                elif dur < 4 and 0 <= tau < 0.55:
+                    warn = "⏳ avant la fenêtre de décision 2j (τ 0.55-0.70)"
+                elif dur < 4 and pre_open and side == "OUI":
+                    warn = "⏳ pré-ouverture — la stratégie cœur n'entre qu'à τ 0.55-0.70"
+                elif dur >= 4 and tau < 0.85:
+                    warn = "⏳ 7j : jouable seulement le dernier jour (τ 0.85-0.95, proba ensemble)"
+                elif side == "NON":
+                    warn = "fade : edge mince après coût réel du NON (+2.6c)"
+                rows.append({
+                    "Marché": f"{m['range']} · {m['duration']:.0f}j · {state}",
+                    "Tranche": r["label"], "Côté": side,
+                    "Proba modèle": r["model_prob"], "Prix": px, "Edge": e,
+                    "Avertissement": warn, "_e": e,
+                })
+    prog.empty()
+    if oldest is not None:
+        age_min = (pd.Timestamp(_now) - oldest).total_seconds() / 60
+        if age_min > 15:
+            st.warning(f"⚠️ Données calculées il y a **{age_min:.0f} min** (probas ET prix) — "
+                       "clique **🔄 Rafraîchir cette page** en haut pour un scan frais.")
+        else:
+            st.caption(f"🕐 Calculé il y a {age_min:.0f} min (probas modèle + prix live du carnet).")
+    if failed:
+        st.caption("Ignorés : " + " · ".join(failed))
+    if not rows:
+        st.info(f"Aucune tranche avec un edge ≥ {edge_min:.0%} sur {len(mkts)} marchés scannés. "
+                "Baisse le seuil — ou c'est simplement qu'il n'y a rien à faire aujourd'hui (fréquent).")
+        return
+    sdf = pd.DataFrame(rows).sort_values("_e", ascending=False).drop(columns="_e")
+
+    def _hl(row):
+        w = row["Avertissement"]
+        if w.startswith("⚠️"):
+            return ["background-color: rgba(220,60,60,0.15)"] * len(row)
+        if w.startswith("🎟️"):
+            return ["background-color: rgba(230,170,0,0.15)"] * len(row)
+        if w.startswith("⏳"):
+            return ["background-color: rgba(150,150,150,0.12)"] * len(row)
+        return ["background-color: rgba(0,170,0,0.14)"] * len(row)
+
+    st.dataframe(
+        sdf.style.format({"Proba modèle": "{:.0%}", "Prix": "{:.3f}", "Edge": "{:+.0%}"}).apply(_hl, axis=1),
+        use_container_width=True, hide_index=True, height=min(700, 38 * (len(sdf) + 1)))
+    st.caption("🟢 vert = edge « propre » (aucun piège connu) · 🔴 rouge = piège surge validé par "
+               "backtest (le marché a raison ~4×/5) · 🟡 billet <40 (optionalité, pas résolution) · "
+               "⚪️ gris = hors fenêtre de décision. Les probas des tranches basses en régime calme "
+               "sont surestimées par le modèle (+7pts mesurés) — prudence même en vert.")
+
+
 _astate = _archive_singleton()
 if not _astate["started"]:
     _astate["started"] = True
@@ -1470,8 +1586,8 @@ if _ares and not _astate["shown"]:
         st.toast(f"🗄️ {len(_ares['new'])} marché(s) fraîchement clôturé(s) archivé(s) en 1-min "
                  f"({_ares['points_added']:,} points).".replace(",", " "))
 
-page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions", "🎯 Stratégie",
-                                    "📈 Historique", "🔬 Diagnostic modèle",
+page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "🔎 Scanner d'edges", "💼 Mes positions",
+                                    "🎯 Stratégie", "📈 Historique", "🔬 Diagnostic modèle",
                                     "📐 Backtest τ"], index=0)
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -1479,6 +1595,9 @@ st.sidebar.caption(
     "entre les visites → navigation instantanée, **aucun recalcul** en changeant de page. Rafraîchis "
     "une page pour des prix du carnet d'ordres **live**.")
 
+if page == "🔎 Scanner d'edges":
+    render_scanner_page()
+    st.stop()
 if page == "💼 Mes positions":
     render_positions_page()
     st.stop()
