@@ -197,35 +197,84 @@ def render_positions_page() -> None:
     df = pd.DataFrame(pos)
     if hide_dust:
         df = df[df["valeur_actuelle"] >= 5.0]
-    df = df.sort_values("valeur_actuelle", ascending=False)
-    disp = pd.DataFrame({
-        "Marché": df["marché"].str.replace("Elon Musk # tweets ", "", regex=False),
-        "Tranche": df["tranche"], "Côté": df["côté"],
-        "Mise": df["mise"], "Valeur": df["valeur_actuelle"], "P&L": df["pnl"],
-        "Gain max": df["gain_max"], "Rendement max": df["rendement_max"],
-        "Proba modèle (côté)": df["proba_modèle_côté"], "Edge": df["edge_côté"],
-        "Statut": df["statut"],
-    })
+    if df.empty:
+        st.info("Toutes tes positions sont négligeables (< $5). Décoche le filtre pour les voir.")
+        return
 
-    def _hl(row):
-        if "Réajuster" in str(row["Statut"]):
-            return ["background-color: rgba(220,0,0,0.18)"] * len(row)
-        if "Aligné" in str(row["Statut"]):
-            return ["background-color: rgba(0,170,0,0.16)"] * len(row)
-        return [""] * len(row)
+    # ---- group by market, compute date/state, order chronologically (upcoming/current first) ----
+    _now = dt.datetime.now(dt.timezone.utc)
 
-    sty = (disp.style
-           .format({"Mise": "${:,.0f}", "Valeur": "${:,.0f}", "P&L": "${:,.0f}",
-                    "Gain max": "${:,.0f}", "Rendement max": "{:.0%}",
-                    "Proba modèle (côté)": "{:.1%}", "Edge": "{:+.1%}"}, na_rep="—")
-           .apply(_hl, axis=1))
-    st.dataframe(sty, use_container_width=True, hide_index=True,
-                 height=min(720, 40 * (len(disp) + 1)))
+    def _state(ws_dt, we_dt):
+        if we_dt is None:
+            return "❓ inconnu", 3
+        if _now < ws_dt:
+            return f"🛒 pré-ouverture · démarre dans {_fmt_rel((ws_dt - _now).total_seconds())}", 1
+        if _now < we_dt:
+            return f"🔴 en cours · clôture dans {_fmt_rel((we_dt - _now).total_seconds())}", 0
+        return "🏁 clôturé (à redeem)", 2
+
+    groups = []
+    for slug, g in df.groupby("slug"):
+        ws = g["window_start"].iloc[0]
+        we = g["window_end"].iloc[0]
+        ws_dt = pd.Timestamp(ws).to_pydatetime() if ws else None
+        we_dt = pd.Timestamp(we).to_pydatetime() if we else None
+        label, order = _state(ws_dt, we_dt)
+        date_lbl = _fmt_range(ws_dt, we_dt) if ws_dt and we_dt else g["marché"].iloc[0]
+        groups.append({"slug": slug, "g": g, "ws": ws_dt, "we": we_dt, "state": label,
+                       "order": order, "date": date_lbl,
+                       "val": g["valeur_actuelle"].sum(), "pnl": g["pnl"].sum(),
+                       "mise": g["mise"].sum()})
+    # sort: ongoing → pre-open → settled, then soonest close first within each
+    groups.sort(key=lambda x: (x["order"], x["we"] or dt.datetime.max.replace(tzinfo=dt.timezone.utc)))
+
+    # ---- visual overview: exposure ($) by date, coloured by P&L ----
+    ov = pd.DataFrame([{"date": f"{grp['date']}", "val": grp["val"], "pnl": grp["pnl"]}
+                       for grp in groups])
+    fig = go.Figure(go.Bar(
+        x=ov["val"], y=ov["date"], orientation="h",
+        marker_color=["#2ca02c" if p >= 0 else "#d62728" for p in ov["pnl"]],
+        text=[f"${v:,.0f} · P&L ${p:+,.0f}".replace(",", " ") for v, p in zip(ov["val"], ov["pnl"])],
+        textposition="auto", hoverinfo="skip"))
+    fig.update_layout(height=max(120, 46 * len(ov)), margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis_title="valeur actuelle ($)", yaxis=dict(autorange="reversed"))
+    st.markdown("##### 💰 Exposition par date (vert = en gain, rouge = en perte)")
+    st.plotly_chart(fig, use_container_width=True, key="pos_overview")
+
+    # ---- one card per market/date ----
+    st.markdown("##### 📅 Détail par marché")
+    for grp in groups:
+        g = grp["g"].sort_values("valeur_actuelle", ascending=False)
+        with st.container(border=True):
+            h1, h2, h3 = st.columns([3, 1.4, 1.4])
+            h1.markdown(f"**📅 {grp['date']}**  \n{grp['state']}")
+            h2.metric("Exposé", f"${grp['val']:,.0f}".replace(",", " "))
+            h3.metric("P&L", f"${grp['pnl']:+,.0f}".replace(",", " "),
+                      delta=f"{grp['pnl']/grp['mise']:+.0%}" if grp["mise"] > 0 else None,
+                      delta_color="normal")
+            sub = pd.DataFrame({
+                "Tranche": g["tranche"], "Côté": g["côté"],
+                "Mise": g["mise"], "Valeur": g["valeur_actuelle"], "P&L": g["pnl"],
+                "Proba modèle": g["proba_modèle_côté"], "Edge": g["edge_côté"],
+                "Statut": g["statut"],
+            })
+
+            def _hl(row):
+                s = str(row["Statut"])
+                if "Réajuster" in s:
+                    return ["background-color: rgba(220,0,0,0.16)"] * len(row)
+                if "Aligné" in s:
+                    return ["background-color: rgba(0,170,0,0.14)"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                sub.style.format({"Mise": "${:,.0f}", "Valeur": "${:,.0f}", "P&L": "${:+,.0f}",
+                                  "Proba modèle": "{:.0%}", "Edge": "{:+.0%}"}, na_rep="—").apply(_hl, axis=1),
+                use_container_width=True, hide_index=True)
     st.caption(
-        "**Statut** : compare la proba du modèle pour ton côté au prix de marché de ce côté. "
-        "🟢 **Aligné** = le modèle te donne encore un edge (> +3 pts) → garde. "
-        "🔴 **Réajuster** = le modèle est désormais en-dessous du prix (< −3 pts) → ta position est "
-        "richement valorisée, envisage d'alléger/sortir. ≈ Neutre = pas de signal net."
+        "Groupé par **date de marché** (en cours d'abord, puis pré-ouverture, puis clôturés à redeem). "
+        "🟢 **Aligné** = le modèle te donne encore un edge (> +3 pts) → garde · 🔴 **Réajuster** = modèle "
+        "sous le prix → position richement valorisée, envisage d'alléger/sortir."
     )
 
 
@@ -238,6 +287,9 @@ def cached_strategy(bankroll: float, kelly: float, edge_thr: float, max_sigma: f
 
 
 def render_strategy_page() -> None:
+    # LEGACY — retiré de la navigation (juil. 2026) : ce moteur Kelly multi-marchés continu n'est PAS
+    # la stratégie validée (docs/STRATEGY.md = leader confirmé, encart 🧭 Décision sur Analyse marché).
+    # Conservé pour référence/expérimentation ; ré-ajouter à la radio "📄 Page" pour le réactiver.
     st.title("🎯 Stratégie multi-marchés")
     _refresh_button("rf_strategy", cached_strategy, cached_positions)
     st.caption(
@@ -1587,7 +1639,7 @@ if _ares and not _astate["shown"]:
                  f"({_ares['points_added']:,} points).".replace(",", " "))
 
 page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "🔎 Scanner d'edges", "💼 Mes positions",
-                                    "🎯 Stratégie", "📈 Historique", "🔬 Diagnostic modèle",
+                                    "📈 Historique", "🔬 Diagnostic modèle",
                                     "📐 Backtest τ"], index=0)
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -1600,9 +1652,6 @@ if page == "🔎 Scanner d'edges":
     st.stop()
 if page == "💼 Mes positions":
     render_positions_page()
-    st.stop()
-if page == "🎯 Stratégie":
-    render_strategy_page()
     st.stop()
 if page == "📈 Historique":
     render_history_page()

@@ -106,7 +106,8 @@ def analyze(address: str, n_sims: int = 12000, now: dt.datetime | None = None) -
                 tbl = next((t for t in run.table
                             if t["low"] <= mid <= (t["high"] if t["high"] != float("inf") else 1e9)),
                            None)
-            rows.append(_row(p, tbl, run.market.title))
+            rows.append(_row(p, tbl, run.market.title,
+                             ws=run.window_start, we=run.window_end))
 
     df_rows = rows
     n = len(df_rows)
@@ -128,7 +129,8 @@ def analyze(address: str, n_sims: int = 12000, now: dt.datetime | None = None) -
     return {"positions": df_rows, "summary": summary}
 
 
-def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None = None) -> dict:
+def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None = None,
+         ws: dt.datetime | None = None, we: dt.datetime | None = None) -> dict:
     size = float(p.get("size", 0))
     avg = float(p.get("avgPrice", 0))
     cur = float(p.get("curPrice", 0))
@@ -165,6 +167,8 @@ def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None 
     return {
         "marché": market_title or p.get("eventSlug", ""),
         "slug": p.get("eventSlug", ""),
+        "window_start": ws.isoformat() if ws is not None else None,
+        "window_end": we.isoformat() if we is not None else None,
         "token_id": p.get("asset", ""),  # CLOB token id of the held outcome — needed to place orders
         "tranche": _label_from_title(p.get("title", "")),
         "côté": side,
