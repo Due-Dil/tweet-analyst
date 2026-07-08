@@ -86,11 +86,19 @@ l'espérance. Le TP monte le % de trades gagnants (83% vs 75%) mais divise l'EV 
 émotionnel payé en espérance. Seule sortie anticipée valide : **vendre ≥0,95 à τ≥0,90** (assurance
 bord de tranche à ~5 pts, pas un take-profit).
 
-### Stratégie d'appoint (optionnelle, petite taille)
+### Stratégie d'appoint (optionnelle, petite taille) — le fade « ancrage +1 »
 
-Fade tardif : à τ ∈ [0.70, 0.85], acheter **NON** (au vrai prix NON) sur une tranche non-leader
-que le modèle dit surpayée de ≥5pts → 77% win, +7,8% ROI/trade. À n'utiliser qu'en complément,
-mise ≤5%, car l'edge est mince après coûts réels.
+**Mécanisme identifié (analyse du 8 juil., 75 paires de marchés consécutifs)** : après une
+résolution, la foule ancre *au-dessus* — elle sur-paie systématiquement la tranche **juste
+au-dessus de l'ex-gagnante** (« il va accélérer ») alors que la réalité répète (l'ex-gagnante
+re-gagne 36% du temps vs ~12% uniforme, et le marché la SOUS-price de −7pts à mi-fenêtre — edge
+déjà capturé par la stratégie cœur via le leader modèle : ex-gagnante ∩ leader = 78% win/+28%).
+
+**La règle d'appoint** : à τ≈0.60, acheter **NON** (vrai prix NON) sur la tranche **+1 au-dessus
+de l'ex-gagnante** si son prix OUI ∈ [0.08, 0.60] → complet 75% win / +8,1% ; **récent (mars→juil)
+81% win / +14,3% ROI, médiane +24,5%** (n=21). Biais en RENFORCEMENT (+11,4pts avr-juil vs −1,2
+jan-mars). Mise ≤5% ; remplace l'ancien fade générique (même famille, mécanisme précisé, ROI ~2×).
+NB : biais symétrique plus faible sur la tranche −1 en-dessous (+2,5-4pts) — pas assez après coûts.
 
 ### 2bis. Le « billet \<40 » — jeu d'optionalité pré-ouverture (validé le 2 juil., 40 marchés)
 
