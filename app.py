@@ -90,6 +90,17 @@ def cached_history(address: str, token: int) -> dict:
     return HIST.performance_history(address)
 
 
+@st.cache_data(show_spinner=False, ttl=120)
+def cached_slug_positions(address: str, slug: str, token: int) -> dict:
+    """Open positions on a single market, keyed by bracket low-bound. Read-only, no model run.
+    Short TTL (positions change when you trade) + cleared by the page refresh button, so a bet
+    opened mid-session shows up without a full restart."""
+    try:
+        return POS.open_positions_for_slug(address, slug)
+    except Exception:  # noqa: BLE001  (never break the analysis page on a positions read)
+        return {}
+
+
 def render_history_page() -> None:
     st.title("📈 Mon historique de performance — marchés Elon")
     _refresh_button("rf_history", cached_history)
@@ -1767,7 +1778,8 @@ if page == "📐 Backtest τ":
     st.stop()
 
 st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
-_refresh_button("rf_market", cached_run, list_active_markets, cached_fade_signals)
+_refresh_button("rf_market", cached_run, list_active_markets, cached_fade_signals,
+                cached_slug_positions)
 st.caption(
     "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
     "(bursts) + Monte-Carlo de la fin de semaine. Données: xtracker.polymarket.com (source "
@@ -1809,11 +1821,15 @@ label_by_slug = {m["slug"]: _mkt_label(m) for m in group}
 slug = None
 if group:
     opts = [m["slug"] for m in group]
-    # keep the previous selection if it's still in the filtered list; otherwise reset cleanly
-    if st.session_state.get("sel_market_slug") not in opts:
-        st.session_state.pop("sel_market_slug", None)
+    # Widget KEY is the single source of truth — no explicit `index`. Passing `index` to a keyless
+    # selectbox makes it ignore the first click (you'd have to click twice); a key-bound selectbox
+    # updates its own state on the first interaction. To survive option changes (duration filter,
+    # live auto-refresh) we only reconcile when the remembered pick fell out of the list: reset it
+    # to opts[0] BEFORE the widget is built, so the box never holds an invalid value.
+    if st.session_state.get("market_pick") not in opts:
+        st.session_state["market_pick"] = opts[0]
     slug = pc2.selectbox("Marché (clôture la plus proche en premier)", opts,
-                         format_func=lambda s: label_by_slug.get(s, s), key="sel_market_slug")
+                         format_func=lambda s: label_by_slug.get(s, s), key="market_pick")
 else:
     st.info("Aucun marché actif dans cette catégorie.")
 
@@ -1995,16 +2011,21 @@ if not override and not settled:
             "**acheter NON** et sortir sous ~6 h. *Pas au-dessus de 0.75 (là le pic est mérité).*")
 
 df = pd.DataFrame(R["table"])
-df_disp = pd.DataFrame(
-    {
-        "Tranche": df["label"],
-        "Proba modèle": df["model_prob"],
-        "Prix OUI": df["yes_price"],
-        "Prix NON": df["no_price"],
-        "Action": df["best_side"],
-        "Edge du pari": df["best_edge"],
-    }
-)
+_mypos = cached_slug_positions(POS.load_wallet(), slug, refresh_token)
+_cols = {
+    "Tranche": df["label"],
+    "Proba modèle": df["model_prob"],
+    "Prix OUI": df["yes_price"],
+    "Prix NON": df["no_price"],
+    "Action": df["best_side"],
+    "Edge du pari": df["best_edge"],
+}
+if _mypos:  # only surface the position columns when the wallet actually holds this market
+    _lows = df["low"].astype(int)
+    _cols["Ma pos."] = [_mypos.get(l, {}).get("côté", "—") for l in _lows]
+    _cols["Entrée"] = [_mypos[l]["prix_entrée"] if l in _mypos else float("nan") for l in _lows]
+    _cols["Valeur $"] = [_mypos[l]["valeur_actuelle"] if l in _mypos else float("nan") for l in _lows]
+df_disp = pd.DataFrame(_cols)
 
 
 def _hl_action(row):
@@ -2017,20 +2038,23 @@ def _hl_action(row):
     return [""] * len(row)
 
 
-styled = (
-    df_disp.style.format(
-        {"Proba modèle": "{:.1%}", "Prix OUI": "{:.2f}", "Prix NON": "{:.2f}",
-         "Edge du pari": "{:+.1%}"},
-        na_rep="—",
-    )
-    .apply(_hl_action, axis=1)
-)
+_fmt = {"Proba modèle": "{:.1%}", "Prix OUI": "{:.2f}", "Prix NON": "{:.2f}",
+        "Edge du pari": "{:+.1%}"}
+if _mypos:
+    _fmt.update({"Entrée": "{:.2f}", "Valeur $": "${:.2f}"})
+styled = df_disp.style.format(_fmt, na_rep="—").apply(_hl_action, axis=1)
 st.dataframe(styled, use_container_width=True, hide_index=True, height=min(680, 38 * (len(df) + 1)))
 st.caption(
     "**Action** = côté recommandé. 🟢 Vert = acheter **OUI** (tranche sous-cotée). "
     "🔵 Bleu = acheter **NON** (tranche surcotée). *Edge du pari* = avantage estimé du côté "
     "recommandé, après recalibrage γ. Seuls les paris à edge > 3 pts sont surlignés."
 )
+if _mypos:
+    _tot = sum(v["valeur_actuelle"] for v in _mypos.values())
+    _pnl = sum(v["pnl"] for v in _mypos.values())
+    st.caption(f"💼 **Mes positions sur ce marché** : {len(_mypos)} tranche(s), valeur totale "
+               f"**${_tot:,.2f}** · P&L latent **{_pnl:+,.2f}$** (côté & prix d'entrée par ligne "
+               "ci-dessus). Lecture seule via ton wallet.")
 
 render_decision_section(R)
 render_fade_anchor_section(R)
