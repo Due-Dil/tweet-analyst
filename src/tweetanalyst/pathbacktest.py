@@ -110,7 +110,10 @@ def _series_events(limit: int = 100, max_pages: int = 4, closed: bool = True) ->
             out.extend(d)
             if len(d) < limit:
                 break
-    return out
+    # Global newest-first across ALL series — critical for callers that truncate (e.g.
+    # archive_recent's max_markets): without this, the per-series concatenation puts every
+    # weekly event before any 2-day event and the cut silently drops all recent 2-day markets.
+    return sorted(out, key=lambda e: e.get("endDate") or "", reverse=True)
 
 
 def enumerate_resolved_series(

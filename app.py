@@ -1511,6 +1511,87 @@ def _auto_archive_bg(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Fade « ancrage +1 » — validated secondary play (docs/STRATEGY.md): after a resolution the crowd
+# overpays the bracket just ABOVE the previous winner; buy NO on it at τ≈0.60.
+# --------------------------------------------------------------------------- #
+_FADE_EXPLANATION = (
+    "**Le mécanisme (mesuré sur 75 paires de marchés consécutifs)** : quand un marché se résout, "
+    "la foule s'ancre *vers le haut* — elle sur-paie la tranche **juste au-dessus de la gagnante "
+    "précédente** (« il va accélérer »), alors qu'Elon **répète** : l'ex-gagnante re-gagne 36% du "
+    "temps (vs ~12% au hasard), et la tranche « +1 » cote ~0.22 en moyenne mais ne gagne que ~11% "
+    "(avril→juil : sur-cote **+11 pts**, en renforcement). \n\n"
+    "**La règle** : à τ≈0.60 (le soir du jour du milieu, en même temps que le check principal), "
+    "**acheter NON** sur cette tranche « +1 » si son prix OUI est entre 0.08 et 0.60. "
+    "Backtest récent (mars→juil) : **81% de réussite, +14,3% de ROI par trade** (n=21, vrais coûts "
+    "NON). C'est une ligne d'appoint : **mise ≤ 5% du bankroll**, tenue à la résolution. "
+    "⚠️ petit échantillon — à re-mesurer tous les mois (re-run du τ-backtest)."
+)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _prev_winner_2d(before_iso: str) -> str | None:
+    """Winner label of the most recently resolved 2-day market before this instant (from archive)."""
+    con = D._conn()
+    try:
+        row = con.execute("SELECT winner FROM resolved_markets WHERE duration_days<4 AND "
+                          "window_end<=? ORDER BY window_end DESC LIMIT 1", (before_iso,)).fetchone()
+    finally:
+        con.close()
+    return row[0].strip() if row and row[0] else None
+
+
+def _fade_anchor_signal(R: dict) -> dict | None:
+    """Detect the fade-anchor setup on a live 2-day market. Returns None, or a dict with
+    status 'ACTIF' (τ in window & price in band) / 'À VENIR' (before the window)."""
+    if R["summary"]["hours_remaining"] <= 0 or R["duration_days"] >= 4:
+        return None
+    tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+    if len(tbl) < 3:
+        return None
+    prev = _prev_winner_2d((W.utc_ts(R["window_start"]) + pd.Timedelta(minutes=5)).isoformat())
+    if not prev:
+        return None
+    labs = sorted([r["label"].strip() for r in tbl], key=_lo_of_label)
+    if prev not in labs or labs.index(prev) + 1 >= len(labs):
+        return None
+    plus1 = labs[labs.index(prev) + 1]
+    row = next(r for r in tbl if r["label"].strip() == plus1)
+    span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
+    tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
+    yes = float(row["yes_price"])
+    no_px = float(row["no_price"]) if row.get("no_price") is not None else 1.0 - yes
+    in_band = 0.08 <= yes <= 0.60
+    if 0.50 <= tau <= 0.70 and in_band:
+        status = "ACTIF"
+    elif tau < 0.50:
+        status = "À VENIR"
+    else:
+        return None
+    t_check = (W.utc_ts(R["window_start"]) + pd.Timedelta(seconds=span * 0.60)).tz_convert(W.ET)
+    return {"status": status, "prev": prev, "plus1": plus1, "yes": yes, "no": no_px,
+            "tau": tau, "t_check_et": t_check}
+
+
+def render_fade_anchor_section(R: dict) -> None:
+    sig = _fade_anchor_signal(R)
+    if sig is None:
+        return
+    st.markdown("#### 🧲 Signal d'appoint — fade « ancrage +1 »")
+    if sig["status"] == "ACTIF":
+        stake = _load_bankroll() * 0.05
+        st.info(f"**✅ ACTIF** — le marché précédent s'est résolu sur **{sig['prev']}** ; la foule "
+                f"sur-paie historiquement la tranche au-dessus, **{sig['plus1']}** (OUI {sig['yes']:.2f}). "
+                f"→ **ACHETER NON {sig['plus1']} @ ~{min(sig['no']+0.01, 0.99):.2f}**, "
+                f"mise ≤ 5% (${stake:,.0f}), tenir à la résolution.".replace(",", " "))
+    else:
+        st.caption(f"⏳ **À évaluer à τ0.60** ({sig['t_check_et']:%a %d %b %H:%M} ET) : ex-gagnante = "
+                   f"**{sig['prev']}** → candidate au fade : **{sig['plus1']}** "
+                   f"(OUI {sig['yes']:.2f} actuellement ; il faudra 0.08 ≤ prix ≤ 0.60).")
+    with st.expander("ℹ️ Comprendre ce signal (mécanisme + chiffres)"):
+        st.markdown(_FADE_EXPLANATION)
+
+
+# --------------------------------------------------------------------------- #
 # Edge scanner page — every live Elon market (incl. pre-open), every bracket, sorted by edge,
 # annotated with the validated warnings (surge trap, decision window, <40 ticket).
 # --------------------------------------------------------------------------- #
@@ -1537,7 +1618,7 @@ def render_scanner_page() -> None:
                            default=["OUI (modèle > marché)", "NON (marché surpayé)"], key="scan_sides")
 
     _now = dt.datetime.now(dt.timezone.utc)
-    rows, failed = [], []
+    rows, failed, fades = [], [], []
     oldest = None
     prog = st.progress(0.0, text="Scan des marchés…")
     for i, m in enumerate(mkts):
@@ -1550,6 +1631,9 @@ def render_scanner_page() -> None:
             continue
         r_now = W.utc_ts(R["now"])
         oldest = r_now if oldest is None else min(oldest, r_now)
+        _fs = _fade_anchor_signal(R)
+        if _fs is not None:
+            fades.append({**_fs, "range": m["range"]})
         span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
         tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
         pre_open = tau < 0
@@ -1601,6 +1685,25 @@ def render_scanner_page() -> None:
             st.caption(f"🕐 Calculé il y a {age_min:.0f} min (probas modèle + prix live du carnet).")
     if failed:
         st.caption("Ignorés : " + " · ".join(failed))
+
+    # ---- rule-based signal: fade « ancrage +1 » (independent of the edge filter) ----
+    st.markdown("##### 🧲 Fade « ancrage +1 » — signal de règle (indépendant du filtre d'edge)")
+    if fades:
+        for s in fades:
+            if s["status"] == "ACTIF":
+                st.success(f"**✅ ACTIF — {s['range']}** : le marché précédent a résolu **{s['prev']}** "
+                           f"→ la foule sur-paie la tranche au-dessus, **{s['plus1']}** "
+                           f"(OUI {s['yes']:.2f}). **ACHETER NON @ ~{min(s['no']+0.01,0.99):.2f}**, "
+                           f"mise ≤5%, tenir à la résolution.")
+            else:
+                st.caption(f"⏳ {s['range']} : à évaluer à τ0.60 ({s['t_check_et']:%a %H:%M} ET) — "
+                           f"ex-gagnante **{s['prev']}**, candidate **{s['plus1']}** (OUI {s['yes']:.2f}).")
+    else:
+        st.caption("Aucun setup fade détecté sur les marchés 2j en cours.")
+    with st.expander("ℹ️ Comprendre le signal fade « ancrage +1 » (mécanisme + chiffres du backtest)"):
+        st.markdown(_FADE_EXPLANATION)
+    st.markdown("---")
+
     if not rows:
         st.info(f"Aucune tranche avec un edge ≥ {edge_min:.0%} sur {len(mkts)} marchés scannés. "
                 "Baisse le seuil — ou c'est simplement qu'il n'y a rien à faire aujourd'hui (fréquent).")
@@ -1930,6 +2033,7 @@ st.caption(
 )
 
 render_decision_section(R)
+render_fade_anchor_section(R)
 render_reliability_section(R)
 
 # --------------------------------------------------------------------------- #
@@ -2015,12 +2119,42 @@ figh.add_annotation(x=et_h, y=1.02, yref="paper", showarrow=False,
 figh.add_shape(type="rect", x0=now_et.hour - 0.5, x1=now_et.hour + 0.5,
                y0=et_day - 0.5, y1=et_day + 0.5, xref="x", yref="y",
                line=dict(color="#00B3B3", width=3), fillcolor="rgba(0,0,0,0)")
+
+# ---- realized tweets of the CURRENT window so far: per-cell counts + dotted outline of the
+# elapsed span (one rectangle per ET calendar day covered) ----
+_ws_ts = W.utc_ts(R["window_start"])
+_eff_end = min(W.utc_ts(R["now"]), W.utc_ts(R["window_end"]))
+_n_win = 0
+if _eff_end > _ws_ts:
+    _pw = D.load_posts(handle, start=_ws_ts.to_pydatetime(), end=_eff_end.to_pydatetime())
+    _n_win = len(_pw)
+    if _n_win:
+        _et_t = _pw["created_at"].dt.tz_convert(W.ET)
+        for (dw, hh), n in _pw.groupby([_et_t.dt.weekday, _et_t.dt.hour]).size().items():
+            figh.add_annotation(x=int(hh), y=int(dw), text=str(int(n)), showarrow=False,
+                                font=dict(size=10, color="#0B3D91"),
+                                bgcolor="rgba(255,255,255,0.72)", borderpad=1)
+    _cur = _ws_ts.tz_convert(W.ET)
+    _end_et = _eff_end.tz_convert(W.ET)
+    while _cur < _end_et:
+        _day_end = min(_cur.normalize() + pd.Timedelta(days=1), _end_et)
+        _h0 = _cur.hour + _cur.minute / 60.0
+        _h1 = (_day_end - _cur.normalize()).total_seconds() / 3600.0
+        figh.add_shape(type="rect", x0=_h0 - 0.5, x1=min(_h1, 24.0) - 0.5,
+                       y0=_cur.weekday() - 0.5, y1=_cur.weekday() + 0.5, xref="x", yref="y",
+                       line=dict(color="rgba(30,90,200,0.85)", width=1.5, dash="dot"),
+                       fillcolor="rgba(0,0,0,0)")
+        _cur = _day_end
+
 figh.update_xaxes(tickmode="array", tickvals=list(range(0, 24, 2)),
                   ticktext=[f"{h:02d}h" for h in range(0, 24, 2)])
 figh.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(figh, use_container_width=True)
-st.caption(f"Le trait et le cadre 🟦 marquent **l'heure ET actuelle** ({now_et:%A %H:%M}) — "
-           "utile pour lire où on se situe dans le rythme d'Elon (et repérer les creux nocturnes).")
+st.caption(f"🟦 trait + cadre plein = **heure ET actuelle** ({now_et:%A %H:%M}). "
+           f"🔵 pointillés = **portion écoulée de la fenêtre du marché** ; les chiffres = tweets "
+           f"**réellement postés** dans chaque case depuis l'ouverture ({_n_win} au total). "
+           "Compare-les au fond de couleur (le rythme habituel) : chiffre élevé sur case claire = "
+           "il sur-performe son habitude, case foncée sans chiffre = il sous-performe.")
 st.caption(
     f"Hawkes: α={R['alpha']:.2f} (part de tweets déclenchés par 'burst'), "
     f"échelle de burst ≈ {R['burst_h']*60:.0f} min. "
