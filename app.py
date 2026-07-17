@@ -1471,11 +1471,13 @@ def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
     conf = M.confidence_report(run.table, run.forecast.samples,
                                run.forecast.summary()["hours_remaining"])
     daily = M.daily_forecast(run.fit, run.window_start, run.window_end)
+    hourly = M.hourly_forecast(run.fit, run.window_start, run.window_end)
     duration_days = (run.window_end - run.window_start).total_seconds() / 86400.0
     # repackage to a cacheable dict (avoid caching heavy objects with live handles)
     return {
         "confidence": conf,
         "daily": daily,
+        "hourly": hourly,
         "gamma_applied": run.gamma,
         "duration_days": duration_days,
         "title": run.market.title,
@@ -2060,6 +2062,82 @@ render_decision_section(R)
 render_fade_anchor_section(R)
 render_reliability_section(R)
 
+
+# --------------------------------------------------------------------------- #
+# Catalyst-research prompt — generated with live market/model context, to paste
+# manually into Claude (web search on). No API connection: the user runs it by hand
+# when they want a news read (e.g. a Grok release week that lifts Elon's activity).
+# --------------------------------------------------------------------------- #
+_JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+            "août", "septembre", "octobre", "novembre", "décembre"]
+
+
+def _dt_fr(t: pd.Timestamp, jour: bool = True) -> str:
+    """'samedi 11 juillet 2026 07:53' — locale-independent French date."""
+    d = f"{t.day} {_MOIS_FR[t.month - 1]} {t.year} {t:%H:%M}"
+    return f"{_JOURS_FR[t.weekday()]} {d}" if jour else d
+
+
+def _catalyst_prompt(R: dict) -> str:
+    s = R["summary"]
+    ws = W.utc_ts(R["window_start"]).tz_convert("US/Eastern")
+    we = W.utc_ts(R["window_end"]).tz_convert("US/Eastern")
+    now_et = W.utc_ts(R["now"]).tz_convert("US/Eastern")
+    brackets = "\n".join(
+        f"  - {r['label']} tweets : {r['model_prob']:.0%}"
+        + (f" (prix marché OUI {r['yes_price']:.2f})" if r.get("yes_price") is not None else "")
+        for r in R["table"] if r["model_prob"] >= 0.02)
+    return f"""Tu es analyste pour un pari Polymarket sur le NOMBRE DE TWEETS d'Elon Musk (posts sur X, \
+comptés par xtracker.polymarket.com, retweets inclus).
+
+CONTEXTE DU MARCHÉ
+- Fenêtre de comptage : du {_dt_fr(ws)} au {_dt_fr(we)} (heure de l'Est, ET).
+- Nous sommes le {_dt_fr(now_et)} ET → il reste ~{s['hours_remaining']:.0f} h avant la clôture.
+- Tweets déjà comptés dans la fenêtre : {s['n_obs']}.
+- Mon modèle statistique (saisonnalité jour×heure + bursts auto-excitants, calibré sur son historique) \
+projette un TOTAL FINAL médian de {s['median']:.0f} tweets, intervalle 90% : {s['p5']:.0f}–{s['p95']:.0f}. \
+Son niveau hebdomadaire moyen récent est ~{R['mean_level']:.0f} tweets/semaine.
+- Probabilités du modèle par tranche (et prix actuels du marché) :
+{brackets}
+
+LIMITE CONNUE : ce modèle ne connaît QUE l'historique de ses tweets. Il est aveugle à l'actualité. \
+Or son volume explose lors d'événements (ex. : la release de Grok 4.5 cette semaine). Ta mission est de \
+combler ce trou.
+
+MISSION — avec la recherche web, identifie tout catalyseur d'ici la clôture ({_dt_fr(we, jour=False)} ET) \
+susceptible d'AUGMENTER ou de RÉDUIRE son volume de tweets. Couvre systématiquement :
+1. xAI / Grok : releases, annonces, benchmarks, polémiques IA.
+2. SpaceX : lancements (Starship surtout), tests, incidents.
+3. Tesla : résultats, livraisons, annonces produit, robotaxi, assemblées.
+4. Politique US : élections, feuds (avec qui est-il en conflit en ce moment ?), nominations, lois.
+5. Légal / médias : procès, dépositions, interviews, podcasts, documentaires.
+6. Son activité X ACTUELLE : est-il en rafale ces dernières 24-48 h ? sur quels sujets ? un thread \
+en cours ? A-t-il annoncé un déplacement/événement (qui réduit souvent son volume) ?
+
+FORMAT DE SORTIE
+a) Tableau : | Catalyseur | Date/heure estimée (ET) | Proba qu'il survienne | Impact volume attendu \
+(↑ faible +5-15% / ↑ moyen +15-40% / ↑ fort >+40% / ↓ réduction) | Justification (1 ligne, source datée) |
+b) VERDICT : ajustement suggéré du total médian ({s['median']:.0f} → ta fourchette), la tranche que tu \
+favorises parmi la liste ci-dessus, et ta confiance (faible/moyenne/haute).
+c) Ce qui pourrait invalider ton verdict (1-3 points).
+
+Règles : ne compte QUE des sources datées de moins de 7 jours ; distingue les faits programmés \
+(lancement annoncé) des spéculations ; si tu ne trouves rien de significatif, dis-le clairement — \
+« pas de catalyseur » est une réponse utile (le modèle statistique reste alors la meilleure estimation)."""
+
+
+with st.expander("🔮 Analyse des catalyseurs — prompt à coller dans Claude (recherche web)"):
+    st.markdown(
+        "Le modèle est **aveugle à l'actualité** (release Grok, lancement SpaceX, feud politique…). "
+        "Ce prompt — pré-rempli avec le contexte live du marché ci-dessus — se colle dans "
+        "**claude.ai** (active la recherche web) pour obtenir une lecture qualitative des "
+        "catalyseurs de la semaine. Manuel, gratuit, aucun appel API depuis l'app ; à toi de "
+        "décider si le verdict justifie d'ajuster ta mise.")
+    st.code(_catalyst_prompt(R), language=None)
+    st.caption("📋 Bouton *copier* en haut à droite du bloc. Le prompt embarque les chiffres du "
+               "dernier calcul — rafraîchis la page avant si besoin.")
+
 # --------------------------------------------------------------------------- #
 # Charts
 # --------------------------------------------------------------------------- #
@@ -2170,15 +2248,71 @@ if _eff_end > _ws_ts:
                        fillcolor="rgba(0,0,0,0)")
         _cur = _day_end
 
+# ---- model forecast of the REMAINING tweets: full simulated distribution per future ET hour
+# (seasonal background + Hawkes bursts + conditional level). Shows the model's real behavior:
+# sleep hours (high P(0), tiny mean) stay blank, burst-prone hours are flagged. ----
+_fc_sum = 0.0
+if not settled and R.get("hourly"):
+    _we_et = W.utc_ts(R["window_end"]).tz_convert(W.ET)
+    # aggregate hourly buckets by (weekday, hour) cell — sums means, combines tails
+    _fc_cells: dict = {}
+    for _hcell in R["hourly"]:
+        _key = (_hcell["weekday"], _hcell["hour"])
+        _prev = _fc_cells.get(_key)
+        if _prev is None:
+            _fc_cells[_key] = dict(_hcell)
+        else:  # same cell hit twice (full-week window edge) -> merge conservatively
+            _prev["mean"] += _hcell["mean"]
+            _prev["p90"] = max(_prev["p90"], _hcell["p90"])
+            _prev["p_zero"] = min(_prev["p_zero"], _hcell["p_zero"])
+        _fc_sum += _hcell["mean"]
+    for (_wd, _hh), _c in _fc_cells.items():
+        if _c["mean"] < 0.25:  # near-dead hours -> blank cell
+            continue
+        _burst = _c["p90"] >= 4        # burst-prone: 1-in-10 chance of 4+ tweets that hour
+        _quiet = _c["p_zero"] >= 0.65  # probable silence (sleep-ish): dim it
+        if _burst:
+            _txt, _col, _bg = f"<b>~{_c['mean']:.1f}</b>", "#8A3B00", "rgba(255,236,208,0.85)"
+        elif _quiet:
+            _txt, _col, _bg = f"~{_c['mean']:.1f}", "#D9A05B", "rgba(255,248,238,0.45)"
+        else:
+            _txt, _col, _bg = f"~{_c['mean']:.1f}", "#C06A2A", "rgba(255,244,230,0.72)"
+        figh.add_annotation(x=int(_hh), y=int(_wd), text=_txt, showarrow=False,
+                            font=dict(size=9, color=_col), bgcolor=_bg, borderpad=1)
+    # invisible scatter -> hover with the full per-cell distribution
+    _hx = [hh for (_, hh) in _fc_cells]
+    _hy = [wd for (wd, _) in _fc_cells]
+    _hcust = [[c["mean"], c["p90"], c["p_zero"]] for c in _fc_cells.values()]
+    figh.add_trace(go.Scatter(
+        x=_hx, y=_hy, mode="markers", marker=dict(size=14, opacity=0),
+        customdata=_hcust, showlegend=False, hoverlabel=dict(bgcolor="#FFF3E0"),
+        hovertemplate="prévu %{customdata[0]:.1f} tweet(s) · p90 %{customdata[1]:.0f} · "
+                      "P(silence) %{customdata[2]:.0%}<extra>modèle</extra>"))
+    _cur2 = max(now_et, W.utc_ts(R["window_start"]).tz_convert(W.ET))
+    while _cur2 < _we_et:
+        _day_end2 = min(_cur2.normalize() + pd.Timedelta(days=1), _we_et)
+        _h0 = _cur2.hour + _cur2.minute / 60.0
+        _h1 = (_day_end2 - _cur2.normalize()).total_seconds() / 3600.0
+        figh.add_shape(type="rect", x0=_h0 - 0.5, x1=min(_h1, 24.0) - 0.5,
+                       y0=_cur2.weekday() - 0.5, y1=_cur2.weekday() + 0.5, xref="x", yref="y",
+                       line=dict(color="rgba(200,110,0,0.9)", width=1.5, dash="dot"),
+                       fillcolor="rgba(0,0,0,0)")
+        _cur2 = _day_end2
+
 figh.update_xaxes(tickmode="array", tickvals=list(range(0, 24, 2)),
                   ticktext=[f"{h:02d}h" for h in range(0, 24, 2)])
 figh.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(figh, use_container_width=True)
 st.caption(f"🟦 trait + cadre plein = **heure ET actuelle** ({now_et:%A %H:%M}). "
-           f"🔵 pointillés = **portion écoulée de la fenêtre du marché** ; les chiffres = tweets "
-           f"**réellement postés** dans chaque case depuis l'ouverture ({_n_win} au total). "
-           "Compare-les au fond de couleur (le rythme habituel) : chiffre élevé sur case claire = "
-           "il sur-performe son habitude, case foncée sans chiffre = il sous-performe.")
+           f"🔵 pointillés bleus = **portion écoulée** ; chiffres bleus = tweets **réellement postés** "
+           f"par case ({_n_win} au total). "
+           f"🟧 pointillés orange = **portion à venir**, chiffres = tweets **prévus par le modèle** "
+           f"par case (simulation complète : saisonnalité + bursts + niveau ; ≈ **{_fc_sum:.0f}** au "
+           f"total d'ici la clôture). ⚠️ Le chiffre est une *moyenne* — Elon ne tweete pas 1/h : le "
+           f"modèle simule **65 % d'heures à zéro** et des rafales (validé sur 12 semaines). "
+           f"**Survole une case** pour voir p90 (potentiel de rafale) et P(silence). "
+           f"**Gras foncé** = risque de rafale (p90 ≥ 4) · **estompé** = silence probable "
+           "(P(0) ≥ 65 %, sommeil) · normal = activité régulière attendue.")
 st.caption(
     f"Hawkes: α={R['alpha']:.2f} (part de tweets déclenchés par 'burst'), "
     f"échelle de burst ≈ {R['burst_h']*60:.0f} min. "

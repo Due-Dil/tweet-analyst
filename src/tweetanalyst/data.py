@@ -327,6 +327,33 @@ def get_market(slug: str) -> MarketEvent:
     )
 
 
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"], 1)}
+
+
+def _infer_span_days(text: str, end: dt.datetime) -> Optional[int]:
+    """Infer a market's length in days from the two <month>-<day> dates in its slug/title
+    (e.g. 'july-13-july-15' -> 2). Returns None if two dates can't be parsed."""
+    import re
+
+    pairs = re.findall(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"[\s\-]+([0-9]{1,2})", text.lower())
+    if len(pairs) < 2:
+        return None
+    (m1, d1), (m2, d2) = pairs[0], pairs[1]
+    try:
+        start = dt.date(end.year, _MONTHS[m1], int(d1))
+        finish = dt.date(end.year, _MONTHS[m2], int(d2))
+    except (ValueError, KeyError):
+        return None
+    if finish < start:  # Dec -> Jan year wrap
+        finish = dt.date(end.year + 1, _MONTHS[m2], int(d2))
+    span = (finish - start).days
+    return span if 1 <= span <= 14 else None
+
+
 def resolve_window(
     slug: str, market: MarketEvent, handle: str = DEFAULT_HANDLE
 ) -> tuple[dt.datetime, dt.datetime]:
@@ -335,7 +362,8 @@ def resolve_window(
     Gamma's ``event.startDate`` is the *creation* time, not the counting start, so we
     prefer the XTracker tracking window (exact, DST-correct, variable length). We match the
     tracking whose ``marketLink`` contains the slug; otherwise fall back to Gamma's reliable
-    ``end`` minus a length inferred from the title (default 7 days).
+    ``end`` minus a length inferred from the two dates in the slug/title (default 7 days) —
+    this is what lets a market XTracker hasn't tracked yet still be analysed via a pasted URL.
     """
     try:
         for tw in get_trackings(handle):
@@ -344,9 +372,10 @@ def resolve_window(
     except Exception:  # noqa: BLE001  (offline / API hiccup -> fall through)
         pass
     end = market.end
-    # Infer span from the title's two dates if possible, else assume a 7-day market.
-    span = dt.timedelta(days=7)
-    return end - span, end
+    span_days = _infer_span_days(slug, end)
+    if span_days is None:
+        span_days = _infer_span_days(getattr(market, "title", "") or "", end) or 7
+    return end - dt.timedelta(days=span_days), end
 
 
 def slug_from_url(url: str) -> str:
