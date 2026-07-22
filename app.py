@@ -80,6 +80,108 @@ def _refresh_button(key: str, *cache_fns) -> None:
         st.rerun()
 
 
+def _regen_tau_if_needed() -> list[str]:
+    """Regenerate the τ-backtest CSVs (reliability table + Backtest τ page) only for a market
+    duration that actually gained a resolved market. Mirrors scripts/tools/sync_data.py step 3.
+    Runs the regen with the app's own interpreter (has disk access, unlike the old launchd job)."""
+    import subprocess
+
+    msgs: list[str] = []
+    con = D._conn()
+    try:
+        arch = pd.read_sql_query("SELECT duration_days FROM resolved_markets", con)
+    finally:
+        con.close()
+    for dur, csv in [("2", "backtest_data/tau_backtest_2d.csv"),
+                     ("7", "backtest_data/tau_backtest_7d.csv")]:
+        n_arch = int(((arch["duration_days"] < 4) if dur == "2"
+                      else (arch["duration_days"] >= 4)).sum())
+        n_csv = pd.read_csv(csv)["slug"].nunique() if Path(csv).exists() else 0
+        if n_arch > n_csv:
+            msgs.append(f"τ-backtest {dur}j : {n_csv} → {n_arch} marchés, régénération…")
+            subprocess.run([sys.executable, "scripts/backtests/run_tau_backtest.py", dur],
+                           check=False)
+            msgs.append(f"τ-backtest {dur}j : ✅ régénéré")
+        else:
+            msgs.append(f"τ-backtest {dur}j : à jour ({n_csv} marchés)")
+    return msgs
+
+
+def _n_resolved_same_duration(is_2d: bool) -> int:
+    con = D._conn()
+    try:
+        cond = "duration_days < 4" if is_2d else "duration_days >= 4"
+        return int(con.execute(f"SELECT COUNT(*) FROM resolved_markets WHERE realized IS NOT NULL "
+                               f"AND {cond}").fetchone()[0])
+    finally:
+        con.close()
+
+
+def _historical_bracket_dist(table_rows: list, is_2d: bool, n_recent: int):
+    """Empirical distribution of resolved markets across the CURRENT market's brackets: bins each
+    recent same-duration resolved market's realized final count into these brackets. Returns
+    (fractions aligned to table_rows order, n_markets_used, list of realized totals used)."""
+    con = D._conn()
+    try:
+        cond = "duration_days < 4" if is_2d else "duration_days >= 4"
+        rows = con.execute(f"SELECT realized FROM resolved_markets WHERE realized IS NOT NULL AND "
+                           f"{cond} ORDER BY window_end DESC LIMIT ?", (int(n_recent),)).fetchall()
+    finally:
+        con.close()
+    totals = [int(r[0]) for r in rows]
+    edges = [(float(r["low"]), float(r["high"]) if np.isfinite(r["high"]) else float("inf"))
+             for r in table_rows]
+    counts = [0] * len(edges)
+    for t in totals:
+        for i, (lo, hi) in enumerate(edges):
+            if lo <= t <= hi:
+                counts[i] += 1
+                break
+    n = len(totals)
+    frac = [c / n for c in counts] if n else [0.0] * len(edges)
+    return frac, n, totals
+
+
+def render_data_sync_sidebar() -> None:
+    """Manual replacement for the (disabled) weekly launchd sync: refresh the local historical
+    cache — tweets (XTracker) + freshly-resolved markets (Polymarket) + τ-backtest CSVs — that
+    feeds the model and the backtests. Runs in-process, on demand, on every page."""
+    with st.sidebar:
+        st.markdown("### 🗄️ Données du modèle")
+        st.caption("Met à jour le cache local (tweets + marchés résolus + backtests). "
+                   "À lancer quand tu veux — remplace l'ancien sync auto du lundi. "
+                   "⏱️ Quelques secondes, ou 1-2 min si des grilles de backtest doivent être régénérées.")
+        if st.button("⬇️ Mettre à jour les données", key="manual_data_sync",
+                     use_container_width=True):
+            with st.status("Synchronisation des données…", expanded=True) as _status:
+                try:
+                    st.write("📥 Tweets — récupération incrémentale (XTracker)…")
+                    _posts = D.ensure_history("elonmusk")
+                    _last = _posts["created_at"].max()
+                    st.write(f"→ **{len(_posts):,}** tweets en local · dernier {_last:%d/%m %H:%M} UTC"
+                             .replace(",", " "))
+                    st.write("🗂️ Marchés — archivage des marchés fraîchement résolus (Polymarket)…")
+                    _res = ARCH.archive_recent(handle="elonmusk", lookback=12)
+                    st.write(f"→ {_res['scanned']} scannés · **{len(_res['new'])} nouveaux** · "
+                             f"{_res['skipped']} déjà en stock")
+                    # always reconcile the τ-backtest CSVs against the archive (they can lag even
+                    # when nothing is newly archived this run — e.g. archived by the launch daemon
+                    # in a prior session but never regenerated). Regen only fires per-duration when
+                    # the CSV is actually behind; can take 1-2 min then.
+                    st.write("🔬 Backtests — vérification des grilles τ…")
+                    for _m in _regen_tau_if_needed():
+                        st.write(f"→ {_m}")
+                    st.cache_data.clear()  # force the whole app to recompute on the fresh cache
+                    st.session_state["_data_sync_when"] = dt.datetime.now()
+                    _status.update(label="✅ Données à jour", state="complete", expanded=False)
+                except Exception as e:  # noqa: BLE001
+                    _status.update(label="❌ Échec de la synchronisation", state="error")
+                    st.error(str(e))
+        _when = st.session_state.get("_data_sync_when")
+        if _when:
+            st.caption(f"🕐 Dernière mise à jour manuelle : **{_when:%d/%m à %H:%M}**")
+
+
 @st.cache_data(show_spinner="Lecture des positions…", ttl=None)
 def cached_positions(address: str, n_sims: int, token: int) -> dict:
     return POS.analyze(address, n_sims=n_sims)
@@ -1758,6 +1860,8 @@ page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "🔎 Scanner d'ed
                                     "📈 Historique", "🔬 Diagnostic modèle",
                                     "📐 Backtest τ"], index=0)
 st.sidebar.markdown("---")
+render_data_sync_sidebar()
+st.sidebar.markdown("---")
 st.sidebar.caption(
     "Chaque page a son bouton **🔄 Rafraîchir cette page** (en haut). Les données restent en cache "
     "entre les visites → navigation instantanée, **aucun recalcul** en changeant de page. Rafraîchis "
@@ -2166,6 +2270,49 @@ with col_r:
                        legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig2, use_container_width=True)
 
+# ---- Historical base rate vs model vs market, aligned to THIS market's brackets ----
+st.markdown("#### 📊 Où ont clôturé les marchés passés — Historique vs Modèle vs Marché")
+_is2d = R["duration_days"] < 4
+_n_avail = _n_resolved_same_duration(_is2d)
+if _n_avail < 4:
+    st.info(f"Pas encore assez de marchés {'2 jours' if _is2d else '7 jours'} résolus en base "
+            f"({_n_avail}) pour une distribution historique fiable.")
+else:
+    _n_recent = st.slider(
+        f"Marchés {'2 jours' if _is2d else '7 jours'} récents à inclure (les plus comparables)",
+        4, _n_avail, min(16, _n_avail), key="hist_n",
+        help="Le volume de tweets d'Elon dérive dans le temps : par défaut on ne prend que les "
+             "marchés récents, dont les tranches gagnantes ressemblent à celles d'aujourd'hui. "
+             "Élargis pour plus d'échantillon (mais risque de mélanger d'anciens régimes).")
+    _hfrac, _hn, _htot = _historical_bracket_dist(R["table"], _is2d, _n_recent)
+    _mkt = df["market_price"] if df["market_price"].notna().any() else pd.Series([np.nan] * len(df))
+    # focus on the relevant range: brackets where any of the three series is non-trivial
+    _mask = [(_hfrac[i] > 0) or (df["model_prob"].iloc[i] > 0.01)
+             or (pd.notna(_mkt.iloc[i]) and _mkt.iloc[i] > 0.01) for i in range(len(df))]
+    _labs = [df["label"].iloc[i] for i in range(len(df)) if _mask[i]]
+    _h = [_hfrac[i] for i in range(len(df)) if _mask[i]]
+    _mo = [df["model_prob"].iloc[i] for i in range(len(df)) if _mask[i]]
+    _ma = [_mkt.iloc[i] for i in range(len(df)) if _mask[i]]
+    fig3 = go.Figure()
+    fig3.add_bar(x=_labs, y=_h, name=f"Historique ({_hn} marchés)", marker_color="#8C8C8C")
+    fig3.add_bar(x=_labs, y=_mo, name="Modèle", marker_color="#4C9BE8")
+    if df["market_price"].notna().any():
+        fig3.add_bar(x=_labs, y=_ma, name="Marché", marker_color="#E8B04C")
+    fig3.update_layout(height=380, barmode="group", margin=dict(l=10, r=10, t=30, b=10),
+                       xaxis_title="tranche", yaxis_title="probabilité / fréquence",
+                       legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig3, use_container_width=True)
+    _tot_s = pd.Series(_htot)
+    st.caption(
+        f"⬜ **Historique** = fréquence à laquelle les **{_hn}** derniers marchés "
+        f"{'2 jours' if _is2d else '7 jours'} résolus ont clôturé dans chaque tranche "
+        f"(totaux réels {_tot_s.min():.0f}–{_tot_s.max():.0f}, médiane {_tot_s.median():.0f}), "
+        f"rangés dans les tranches **de ce marché-ci**. 🟦 **Modèle** et 🟧 **Marché** = probas "
+        f"actuelles. Lis-le comme un **taux de base** : si le modèle *et* le marché sur-cotent une "
+        f"tranche que l'historique récent atteint rarement, prudence ; si l'historique concentre "
+        f"une tranche que les deux sous-cotent, c'est une piste. ⚠️ Le volume d'Elon dérive — "
+        f"garde l'échantillon récent pour que la comparaison reste juste.")
+
 # ---- Per-day forecast: actuals + estimated, over the selected market window ----
 st.markdown("#### Prévision du nombre de tweets par jour (réels + estimés)")
 dd = R["daily"]
@@ -2279,9 +2426,11 @@ if not settled and R.get("hourly"):
             _txt, _col, _bg = f"~{_c['mean']:.1f}", "#C06A2A", "rgba(255,244,230,0.72)"
         figh.add_annotation(x=int(_hh), y=int(_wd), text=_txt, showarrow=False,
                             font=dict(size=9, color=_col), bgcolor=_bg, borderpad=1)
-    # invisible scatter -> hover with the full per-cell distribution
+    # invisible scatter -> hover with the full per-cell distribution.
+    # y must use the DAYS category labels (not numeric weekday indices), otherwise Plotly
+    # appends phantom numeric categories above the day rows and the axis scale breaks.
     _hx = [hh for (_, hh) in _fc_cells]
-    _hy = [wd for (wd, _) in _fc_cells]
+    _hy = [DAYS[wd] for (wd, _) in _fc_cells]
     _hcust = [[c["mean"], c["p90"], c["p_zero"]] for c in _fc_cells.values()]
     figh.add_trace(go.Scatter(
         x=_hx, y=_hy, mode="markers", marker=dict(size=14, opacity=0),
