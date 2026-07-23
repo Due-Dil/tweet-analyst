@@ -1227,8 +1227,8 @@ def render_strategy_page() -> None:
                "rentable (75–94 % réussite selon durée, tenu OOS) — mais présence requise.")
     if spikes:
         for s in spikes:
-            st.warning(f"**{s['range']} · {s['tranche']}** — {s['sens']} {s['saut']:+.0%} → "
-                       f"**{s['côté']} @ {s['prix_action']:.2f}** (YES live {s['prix_yes']:.2f}). "
+            st.warning(f"**{s['range']} · {s['tranche']}** — pic {s['saut']:+.0%} → "
+                       f"**{s['côté']} @ {s['prix_no']:.2f}** (YES live {s['prix_yes']:.2f}). "
                        "Sortir < 6 h.")
     else:
         st.caption("Aucune surréaction intraday en ce moment (pic ≥ +8 % en zone 0,25–0,75).")
