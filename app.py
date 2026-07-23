@@ -4,7 +4,6 @@ Lancer :  streamlit run app.py
 """
 from __future__ import annotations
 
-import dataclasses
 import datetime as dt
 import sys
 import threading
@@ -12,8 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import requests
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -24,11 +21,9 @@ from tweetanalyst import backtest as BT  # noqa: E402
 from tweetanalyst import calibration as CAL  # noqa: E402
 from tweetanalyst import crowd as CR  # noqa: E402
 from tweetanalyst import data as D  # noqa: E402
-from tweetanalyst import diagnostics as DG  # noqa: E402
 from tweetanalyst import execution as EXE  # noqa: E402
 from tweetanalyst import history as HIST  # noqa: E402
 from tweetanalyst import model as M  # noqa: E402
-from tweetanalyst import pathbacktest as PB  # noqa: E402
 from tweetanalyst import pipeline as P  # noqa: E402
 from tweetanalyst import positions as POS  # noqa: E402
 from tweetanalyst import strategy as STR  # noqa: E402
@@ -81,7 +76,7 @@ def _refresh_button(key: str, *cache_fns) -> None:
 
 
 def _regen_tau_if_needed() -> list[str]:
-    """Regenerate the τ-backtest CSVs (reliability table + Backtest τ page) only for a market
+    """Regenerate the τ-backtest CSVs (feed the reliability section) only for a market
     duration that actually gained a resolved market. Mirrors scripts/tools/sync_data.py step 3.
     Runs the regen with the app's own interpreter (has disk access, unlike the old launchd job)."""
     import subprocess
@@ -647,641 +642,10 @@ def render_strategy_page() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Diagnostic page — "marché vs modèle" goodness-of-fit
-# --------------------------------------------------------------------------- #
-_VERDICT_EMO = {"normal": "🟢", "limite": "🟡", "extrême": "🔴"}
-
-
-@st.cache_data(show_spinner=False, ttl=None)
-def list_diagnostic_markets(handle: str, token: int = 0) -> list[dict]:
-    """Recent Elon markets (closed + ongoing) with parsed counting windows, newest first.
-
-    Pulls both resolved events (``closed=true``) and the currently open ones (``closed=false``) so an
-    in-progress market shows up immediately, not only once it settles.
-    """
-    now = dt.datetime.now(dt.timezone.utc)
-    out, seen = [], set()
-    for e in PB._series_events(closed=True) + PB._series_events(closed=False):
-        slug = e.get("slug", "")
-        if not slug or slug in seen or slug.startswith("arch-"):
-            continue
-        yhint = None
-        if e.get("endDate"):
-            try:
-                yhint = pd.to_datetime(e["endDate"], utc=True).year
-            except Exception:  # noqa: BLE001
-                yhint = None
-        win = PB.parse_window(e.get("description"), year_hint=yhint)
-        if not win:
-            continue
-        ws, we = win
-        dur = (W.utc_ts(we) - W.utc_ts(ws)).total_seconds() / 86400.0
-        if dur <= 0 or dur > 9:
-            continue
-        if W.utc_ts(ws) > pd.Timestamp(now):
-            continue  # not yet open — nothing to diagnose
-        closed = W.utc_ts(we) <= pd.Timestamp(now)
-        state = "terminé" if closed else "🔴 en cours"
-        seen.add(slug)
-        dur_label = "7j" if dur >= 4 else f"{round(dur)}j"
-        out.append({
-            "slug": slug, "ws_iso": W.utc_ts(ws).isoformat(), "we_iso": W.utc_ts(we).isoformat(),
-            "dur": round(dur, 1), "dur_label": dur_label, "closed": closed,
-            "label": f"{_fmt_range(ws, we)}  ·  {state}",
-        })
-    # newest first within each duration bucket; bucket order handled by the page (group by dur_label)
-    return sorted(out, key=lambda m: m["we_iso"], reverse=True)
-
-
-@st.cache_data(show_spinner=True, ttl=None)
-def cached_diagnose(slug: str, ws_iso: str, we_iso: str, handle: str,
-                    eval_iso: str | None, n_sims: int, token: int = 0) -> dict:
-    """Fit the model as of the window open and diagnose the realized stream vs the model."""
-    ws = dt.datetime.fromisoformat(ws_iso)
-    we = dt.datetime.fromisoformat(we_iso)
-    eval_end = dt.datetime.fromisoformat(eval_iso) if eval_iso else None
-    if eval_end is not None:  # ongoing market: pull the latest tweets before diagnosing
-        D.ensure_history(handle)
-    posts = D.load_posts(handle, end=we)
-    fit = M.fit_model(posts, ws)
-    res = DG.diagnose(fit, ws, we, n_sims=n_sims, rng=np.random.default_rng(7), eval_end=eval_end)
-    return res
-
-
-def _band_fig(x, band: dict, title: str, xlabel: str, x_is_hour: bool = False):
-    """Filled model 5–95 band + median line, realized as bars coloured by tail percentile."""
-    pct = band["pct"]
-    colors = ["#D1495B" if (p < 0.05 or p > 0.95) else "#E8B04C" if (p < 0.15 or p > 0.85)
-              else "#4C9BE8" for p in pct]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=list(x) + list(x)[::-1],
-                             y=list(band["p95"]) + list(band["p5"])[::-1],
-                             fill="toself", fillcolor="rgba(120,120,120,0.18)",
-                             line=dict(width=0), hoverinfo="skip", name="modèle 5–95%"))
-    fig.add_trace(go.Scatter(x=list(x), y=list(band["p50"]), mode="lines",
-                             line=dict(color="#888", dash="dash"), name="médiane modèle"))
-    fig.add_trace(go.Bar(x=list(x), y=list(band["realized"]), marker_color=colors, name="réalisé",
-                         customdata=[f"{p*100:.0f}" for p in pct],
-                         hovertemplate="%{x}<br>réalisé=%{y}<br>percentile=%{customdata}%<extra></extra>"))
-    fig.update_layout(title=title, height=300, margin=dict(l=10, r=10, t=40, b=10),
-                      xaxis_title=xlabel, legend=dict(orientation="h", y=-0.2),
-                      bargap=0.25)
-    if x_is_hour:
-        fig.update_xaxes(dtick=2)
-    return fig
-
-
-def render_diagnostic_page() -> None:
-    st.title("🔬 Diagnostic marché vs modèle")
-    st.caption(
-        "Pour un marché **terminé ou en cours** : on ajuste le modèle à l'ouverture de la fenêtre "
-        "(données d'avant seulement), on simule la fenêtre des milliers de fois, puis on situe **chaque "
-        "caractéristique réalisée** du flux de tweets d'Elon dans la distribution du modèle — "
-        "🟢 normal · 🟡 limite · 🔴 extrême (queue de distribution).")
-    _refresh_button("refresh_diag", list_diagnostic_markets, cached_diagnose)
-
-    token = st.session_state.get("refresh_diag_token", 0)
-    try:
-        mkts = list_diagnostic_markets("elonmusk", token)
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Liste des marchés indisponible : {e}")
-        return
-    if not mkts:
-        st.warning("Aucun marché Elon trouvé.")
-        return
-
-    # ---- group by duration (7j, 2j, …), newest first within each group; default to the open market ----
-    dur_order = sorted({m["dur_label"] for m in mkts}, key=lambda d: -int(d.rstrip("j")))
-    c0, c1, c2 = st.columns([1, 3, 1])
-    dur_label = c0.radio("Durée", dur_order, horizontal=True)
-    group = [m for m in mkts if m["dur_label"] == dur_label]
-    labels = [m["label"] for m in group]
-    default_idx = next((i for i, m in enumerate(group) if not m["closed"]), 0)
-    idx = c1.selectbox("Marché", range(len(group)), format_func=lambda i: labels[i], index=default_idx)
-    n_sims = c2.select_slider("Simulations", [4000, 8000, 20000, 40000], value=20000,
-                              help="Nombre de trajectoires Monte-Carlo tirées du modèle pour estimer "
-                                   "sa distribution (médiane, bande 5–95%) sur cette fenêtre. Plus haut "
-                                   "= bandes plus lisses et percentiles plus précis, mais plus lent. "
-                                   "Même échelle que la page Analyse marché.")
-    chosen = group[idx]
-
-    eval_iso = None
-    if not chosen["closed"]:
-        eval_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-        st.info("Marché **en cours** : la comparaison ne porte que sur la portion déjà écoulée "
-                "(« Elon suit-il le modèle jusqu'ici ? »).")
-
-    res = cached_diagnose(chosen["slug"], chosen["ws_iso"], chosen["we_iso"], "elonmusk",
-                          eval_iso, n_sims, token)
-    m = res["meta"]
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Tweets réalisés", m["realized_total"])
-    k2.metric("Fenêtre évaluée", f"{m['eval_hours']:.0f} h" + (" (partiel)" if m["partial"] else ""))
-    k3.metric("Burstiness (α)", f"{m['alpha']:.2f}")
-    k4.metric("Échelle de burst (1/β)", f"{m['burst_timescale_min']:.0f} min")
-
-    # ---- scalar verdicts table ----
-    st.subheader("Synthèse — chaque paramètre dans la distribution du modèle")
-    rows = []
-    for r in res["scalars"]:
-        rows.append({
-            "": _VERDICT_EMO.get(r["verdict"], ""),
-            "Paramètre": r["param"],
-            "Réalisé": round(r["realized"], 2),
-            "Médiane modèle": round(r["p50"], 1),
-            "Intervalle 5–95%": f"[{r['p5']:.1f} – {r['p95']:.1f}]",
-            "Percentile": f"{r['pct']*100:.0f}%",
-            "Verdict": f"{r['verdict']} ({r['direction']})",
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption("Percentile = position du réalisé parmi les simulations. ~50% = au cœur du modèle ; "
-               "<5% ou >95% = comportement extrême que le modèle n'attendait quasiment pas.")
-
-    # ---- vector diagnostics ----
-    st.subheader("Détail temporel — réalisé vs bande modèle (5–95%)")
-    st.caption(
-        "Chaque barre = nombre réalisé sur ce créneau (heure ou jour) ; la zone grise = bande 5–95% "
-        "**pour ce créneau précis** simulée par le modèle, la ligne pointillée = sa médiane. Couleur de "
-        "la barre = percentile du réalisé *dans la distribution simulée de ce seul créneau* (pas du "
-        "total semaine) : 🔵 normal (15–85%) · 🟡 limite (5–15% ou 85–95%) · 🔴 extrême (<5% ou >95%, "
-        "le modèle n'attendait quasiment pas ce niveau à ce moment-là).")
-    pday = res["per_day"]
-    day_x = [str(d) for d in pday["dates"]]
-    st.plotly_chart(_band_fig(day_x, pday, "Tweets par jour (ET)", "jour ET"),
-                    use_container_width=True)
-    g1, g2 = st.columns(2)
-    with g1:
-        st.plotly_chart(_band_fig(list(range(24)), res["per_hour"],
-                                  "Tweets par heure du jour (ET)", "heure ET", x_is_hour=True),
-                        use_container_width=True)
-    with g2:
-        st.plotly_chart(_band_fig(list(range(24)), res["burst_hour"],
-                                  "Démarrages de burst par heure (ET)", "heure ET", x_is_hour=True),
-                        use_container_width=True)
-    st.caption(f"Un *burst* = salve d'au moins 2 tweets séparés de moins de "
-               f"{m['gap_threshold_min']:.0f} min (≈ quelques fois l'échelle 1/β).")
-
-    render_playback_section(chosen, "elonmusk", token)
-
-
-# --------------------------------------------------------------------------- #
-# Playback — replay a resolved market minute-by-minute against the user's OWN executed trades, with
-# the model's live view + reliability-vs-history at every scrubbed instant.
-# --------------------------------------------------------------------------- #
-def _ff(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch_user_trades(wallet: str, slug: str, token: int = 0) -> list[dict]:
-    """The wallet's executed trades on this market's event, from Polymarket's public data-api."""
-    if not wallet:
-        return []
-    out = []
-    for page in range(20):
-        try:
-            r = requests.get("https://data-api.polymarket.com/trades",
-                             params={"user": wallet, "limit": 500, "offset": page * 500}, timeout=20)
-            d = r.json() if r.status_code == 200 else []
-        except Exception:  # noqa: BLE001
-            break
-        if not isinstance(d, list) or not d:
-            break
-        for t in d:
-            if t.get("eventSlug") != slug:
-                continue
-            title = t.get("title", "") or ""
-            brk = title.split("post ", 1)[1].split(" tweets", 1)[0].strip() if "post " in title and " tweets" in title else None
-            out.append({"ts": int(t["timestamp"]), "side": (t.get("side") or "").upper(),
-                        "size": _ff(t.get("size")) or 0.0, "price": _ff(t.get("price")) or 0.0,
-                        "outcome": (t.get("outcome") or "").capitalize(), "bracket": brk})
-        if len(d) < 500:
-            break
-    return sorted(out, key=lambda x: x["ts"])
-
-
-def _playback_market(slug: str):
-    """Build a ResolvedMarket for playback directly from the Gamma event by slug — lenient (works for
-    just-closed or ongoing markets not yet in the `closed=true` series). Winner=None if unresolved."""
-    import json as _json
-    try:
-        e = requests.get("https://gamma-api.polymarket.com/events", params={"slug": slug}, timeout=20).json()
-    except Exception:  # noqa: BLE001
-        return None
-    ev = e[0] if isinstance(e, list) and e else (e if isinstance(e, dict) else None)
-    if not ev:
-        return None
-    yhint = pd.to_datetime(ev["endDate"], utc=True).year if ev.get("endDate") else None
-    win = PB.parse_window(ev.get("description"), year_hint=yhint)
-    if not win:
-        return None
-    ws, we = win
-    brackets, winner = [], None
-    for mk in ev.get("markets", []):
-        label = mk.get("groupItemTitle") or ""
-        lo, hi = D._parse_bracket_bounds(label)
-        toks = mk.get("clobTokenIds")
-        toks = _json.loads(toks) if isinstance(toks, str) else toks
-        oc = mk.get("outcomes")
-        oc = _json.loads(oc) if isinstance(oc, str) else oc
-        op = mk.get("outcomePrices")
-        op = _json.loads(op) if isinstance(op, str) else op
-        yi = ([o.lower() for o in oc].index("yes") if oc and "yes" in [o.lower() for o in oc] else 0)
-        brackets.append((lo, hi, label, toks[yi] if toks else None))
-        if op and float(op[yi]) > 0.5:
-            winner = label
-    if not brackets or any(b[3] is None for b in brackets):
-        return None
-    brackets.sort(key=lambda b: b[0])
-    return PB.HB.ResolvedMarket(slug, ws, we, 0, winner, brackets)
-
-
-@st.cache_data(show_spinner="Calcul de la trajectoire du modèle sur le marché…", ttl=None)
-def playback_trajectory(slug: str, handle: str, n_grid: int = 48, token: int = 0) -> dict | None:
-    """Fit the model once, then re-forecast on a time grid over the window: per-bracket model prob +
-    real CLOB market price at each grid instant (the deployed model's live view minute-by-minute)."""
-    posts = D.load_posts(handle)
-    mkt = _playback_market(slug)
-    if mkt is None:
-        return None
-    ws, we = W.utc_ts(mkt.window_start), W.utc_ts(mkt.window_end)
-    labels = [b[2] for b in mkt.brackets]
-    winner_idx = next((i for i, b in enumerate(mkt.brackets) if b[2] == mkt.winner), None)
-    widths = [hi - lo + 1 for (lo, hi, _, _) in mkt.brackets if np.isfinite(hi)]
-    bw = float(np.median(widths)) if widths else 20.0
-    dur = (we - ws).total_seconds() / 86400.0
-    gamma = CAL.gamma_for_duration(dur)
-    fit = M.fit_model(posts, mkt.window_start)
-    brs = [D.Bracket(lab, lo, hi, None) for (lo, hi, lab, _) in mkt.brackets]
-    pc = {tok: PB.HB.fetch_prices(tok, mkt.window_start, mkt.window_end) for (_, _, _, tok) in mkt.brackets}
-    rng = np.random.default_rng(7)
-    grid = pd.date_range(ws, we, periods=n_grid)
-    probs, prices = [], []
-    for T in grid:
-        yes = PB.HB.market_probs_at(mkt, T.to_pydatetime(), pc)
-        fc = M.forecast(dataclasses.replace(fit, now=T.to_pydatetime()), mkt.window_start,
-                        mkt.window_end, n_sims=2000, rng=rng)
-        tbl = M.bracket_probabilities(brs, fc.samples, gamma=gamma)
-        probs.append([float(t["model_prob"]) for t in tbl])
-        prices.append([float(v) for v in yes])
-    return {"grid": [t.isoformat() for t in grid], "labels": labels, "winner_idx": winner_idx,
-            "probs": probs, "prices": prices, "ws": ws.isoformat(), "we": we.isoformat(), "dur": dur}
-
-
-def _position_at(trades: list[dict], labels: list[str], yes_prices: list[float], t_cut: int) -> dict:
-    """Net position + running P&L (marked at the grid's YES prices) from trades up to ``t_cut`` (unix)."""
-    shares = {(lab, oc): 0.0 for lab in labels for oc in ("Yes", "No")}
-    cash = 0.0
-    for tr in trades:
-        if tr["ts"] > t_cut or tr["bracket"] not in labels:
-            continue
-        key = (tr["bracket"], tr["outcome"] if tr["outcome"] in ("Yes", "No") else "Yes")
-        sgn = 1.0 if tr["side"] == "BUY" else -1.0
-        shares[key] += sgn * tr["size"]
-        cash -= sgn * tr["size"] * tr["price"]     # BUY spends cash, SELL gains cash
-    rows, mark = [], 0.0
-    for i, lab in enumerate(labels):
-        sy, sn = shares[(lab, "Yes")], shares[(lab, "No")]
-        if abs(sy) < 1e-6 and abs(sn) < 1e-6:
-            continue
-        val = sy * yes_prices[i] + sn * (1.0 - yes_prices[i])
-        mark += val
-        rows.append({"Tranche": lab, "OUI (parts)": round(sy, 1), "NON (parts)": round(sn, 1),
-                     "Valeur @ maintenant": round(val, 2)})
-    return {"rows": rows, "pnl": cash + mark, "cash": cash, "mark": mark}
-
-
-@st.cache_data(show_spinner=False, ttl=None)
-def _reliability_at_tau(dur: float, tau: float, top_prob: float, mtime: float) -> dict | None:
-    """Compact reliability lookup at an arbitrary τ, for the playback panel (2-day history only)."""
-    key, path = _hist_file_for_duration(dur)
-    if path is None:
-        return None
-    hist = _load_hist_grid(str(path), path.stat().st_mtime)
-    step = 0.05
-    g = round(tau / step) * step
-    pts = [t for t in {round(g - step, 3), round(g, 3)} if t > 0]
-    sub = hist[np.isclose(hist["tau"].values[:, None], pts, atol=1e-6).any(axis=1)]
-    if sub["slug"].nunique() < 5:
-        return None
-    lead = sub[sub["model_rank"] == 1]
-    cond, cn = _bracket_hit_rate(lead, top_prob)
-    return {"lead_hit": float(lead["is_winner"].mean()), "lead_n": len(lead),
-            "cond_hit": cond, "cond_n": cn, "checkpoints": pts, "key": key}
-
-
-def render_playback_section(chosen: dict, handle: str, token: int = 0) -> None:
-    st.markdown("---")
-    st.subheader("🎬 Playback — mes trades vs le modèle")
-    if not chosen["closed"]:
-        st.info("Le playback est disponible sur un marché **terminé** (rejeu complet). "
-                "Sélectionne un marché clôturé ci-dessus.")
-        return
-    st.caption("Rejoue le marché dans le temps. **Déplace le curseur** : à cet instant précis tu vois "
-               "ce que le modèle affichait, le prix du marché, **tes trades exécutés**, ta position/P&L "
-               "à ce moment, et la fiabilité du modèle à ce stade (vs historique).")
-
-    wallet = POS.load_wallet()
-    tj = playback_trajectory(chosen["slug"], handle, token=token)
-    if tj is None:
-        st.warning("Marché introuvable dans la série résolue (prix indisponibles).")
-        return
-    trades = fetch_user_trades(wallet, chosen["slug"], token)
-    # pd.Timestamp parses nanosecond-precision ISO strings (datetime.fromisoformat can't, on 3.9)
-    grid = [pd.Timestamp(t).to_pydatetime() for t in tj["grid"]]
-    labels, prices, probs = tj["labels"], tj["prices"], tj["probs"]
-    win_idx = tj["winner_idx"]
-    ws = pd.Timestamp(tj["ws"]).to_pydatetime()
-    span = (pd.Timestamp(tj["we"]).to_pydatetime() - ws).total_seconds()
-
-    if not trades:
-        st.info(f"Aucun trade trouvé pour ton wallet (`{wallet[:6]}…{wallet[-4:]}`) sur ce marché. "
-                "Le playback fonctionne quand même — il montre juste le modèle vs le marché sans tes trades.")
-
-    # ---- time scrubber (snap to nearest grid instant) ----
-    et = [(g - dt.timedelta(hours=4)).strftime("%d/%m %H:%M") for g in grid]
-    gi = st.select_slider("⏱️ Instant du marché (ET)", options=list(range(len(grid))),
-                          value=len(grid) - 1, format_func=lambda i: et[i], key="pb_slider")
-    T = grid[gi]
-    tau = float(np.clip((T - ws).total_seconds() / span, 0, 1))
-
-    # ---- price/trade chart with a vertical 'now' line ----
-    fig = go.Figure()
-    for i, lab in enumerate(labels):
-        is_win = i == win_idx
-        fig.add_trace(go.Scatter(x=grid, y=[p[i] for p in prices], mode="lines", name=lab,
-                                 line=dict(width=3 if is_win else 1,
-                                           color="#1f77b4" if is_win else None),
-                                 opacity=1.0 if is_win else 0.30, legendgroup=lab))
-    for tr in trades:
-        tt = dt.datetime.fromtimestamp(tr["ts"], dt.timezone.utc)
-        if tt < ws:
-            continue
-        buy = tr["side"] == "BUY"
-        fig.add_trace(go.Scatter(
-            x=[tt], y=[tr["price"]], mode="markers", showlegend=False,
-            marker=dict(symbol="triangle-up" if buy else "triangle-down", size=13,
-                        color="#2ca02c" if buy else "#d62728", line=dict(width=1, color="white")),
-            hovertemplate=f"{tr['side']} {tr['outcome']} {tr['bracket']}<br>"
-                          f"{tr['size']:.0f} @ {tr['price']:.3f}<extra></extra>"))
-    fig.add_vline(x=T, line=dict(color="#E8B04C", width=2, dash="dash"))
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
-                      xaxis_title="temps", yaxis=dict(title="prix OUI", range=[0, 1]),
-                      legend=dict(orientation="h", y=-0.2, font=dict(size=9)))
-    st.plotly_chart(fig, use_container_width=True, key="pb_chart")
-    st.caption("Lignes = prix OUI par tranche (gagnante en gras). ▲ vert = tes achats · ▼ rouge = tes "
-               "ventes. Trait jaune = instant sélectionné.")
-
-    # ---- three panels at the scrubbed instant ----
-    st.markdown(f"#### 📍 À **{et[gi]} ET**  ·  τ = {tau:.2f}")
-    p_now, price_now = probs[gi], prices[gi]
-    order = np.argsort(p_now)[::-1]
-    colM, colP, colR = st.columns(3)
-
-    with colM:
-        st.markdown("**🧠 Le modèle à cet instant**")
-        rows = [{"Tranche": labels[i], "Modèle": f"{p_now[i]:.0%}", "Marché": f"{price_now[i]:.2f}",
-                 "Edge": f"{p_now[i]-price_now[i]:+.0%}"} for i in order[:5]]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    with colP:
-        st.markdown("**💼 Ma position ici**")
-        pos = _position_at(trades, labels, price_now, int(T.timestamp()))
-        if pos["rows"]:
-            st.dataframe(pd.DataFrame(pos["rows"]), use_container_width=True, hide_index=True)
-            st.metric("P&L marqué à cet instant", f"${pos['pnl']:+.2f}")
-        else:
-            st.caption("Aucune position ouverte à cet instant.")
-
-    with colR:
-        st.markdown("**🎯 Fiabilité à ce stade**")
-        top_i = int(order[0])
-        rel = None
-        _, hp = _hist_file_for_duration(tj["dur"])
-        if hp is not None:
-            rel = _reliability_at_tau(tj["dur"], tau, float(p_now[top_i]), hp.stat().st_mtime)
-        if rel is None:
-            st.caption("Historique indisponible pour cette durée de marché.")
-        else:
-            st.metric(f"Favori ({labels[top_i]}) — gagne à ce τ", f"{rel['lead_hit']:.0%}",
-                      help=f"Tous favoris confondus, sur {rel['lead_n']} cas aux checkpoints "
-                           f"{rel['checkpoints']}.")
-            if not np.isnan(rel["cond_hit"]):
-                st.caption(f"Conditionné à sa confiance (~{p_now[top_i]:.0%}) : "
-                           f"**{rel['cond_hit']:.0%}** (n={rel['cond_n']}).")
-    if win_idx is not None:
-        st.caption(f"🏁 Résultat final du marché : **{labels[win_idx]}** a gagné.")
-
-
-# --------------------------------------------------------------------------- #
-# Tau-grid backtest page — interactive deep-dive on run_tau_backtest.py output
+# τ-grid backtest CSVs (generated by run_tau_backtest.py) — feed the reliability section below.
 # --------------------------------------------------------------------------- #
 _TAU_FILES = {"2 jours": Path("backtest_data/tau_backtest_2d.csv"),
               "7 jours": Path("backtest_data/tau_backtest_7d.csv")}
-
-
-@st.cache_data(show_spinner=False, ttl=None)
-def load_tau_backtest(path_str: str, mtime: float) -> pd.DataFrame:
-    df = pd.read_csv(path_str)
-    df["pos_bucket"] = df["rel_rank"].clip(-3, 3).map(
-        lambda r: "0 (leader)" if r == 0 else (f"{r:+d}" if abs(r) < 3 else (f"≤{r}" if r < 0 else f"≥+{r}")))
-    return df
-
-
-def _kelly_roi(sub: pd.DataFrame, spread: float = 0.03, kelly: float = 0.25,
-              bankroll: float = 1000.0, side: str = "OUI") -> dict:
-    """Flat-$1 and quarter-Kelly ROI of buying YES (or NO, fading) at price+spread/2, held to close."""
-    if side == "OUI":
-        pe = np.minimum(sub["yes_price"].values + spread / 2.0, 0.999)
-        win = sub["is_winner"].values.astype(float)
-        p = sub["model_prob"].values
-    else:
-        pe = np.minimum(1.0 - sub["yes_price"].values + spread / 2.0, 0.999)
-        win = (~sub["is_winner"].values).astype(float)
-        p = 1.0 - sub["model_prob"].values
-    flat_pnl = (win - pe) / np.maximum(pe, 1e-6)
-    b = (1.0 - pe) / np.maximum(pe, 1e-6)
-    f = np.clip((p * b - (1 - p)) / np.maximum(b, 1e-9), 0.0, 1.0) * kelly
-    stake = bankroll * f
-    shares = np.divide(stake, pe, out=np.zeros_like(stake), where=stake > 0)
-    pnl = shares * win - stake
-    staked = float(stake.sum())
-    n = len(sub)
-    return {"n": n, "win_rate": float(win.mean()) if n else float("nan"),
-            "roi_flat": float(flat_pnl.mean()) if n else float("nan"),
-            "roi_kelly": float(pnl.sum() / staked) if staked > 0 else float("nan")}
-
-
-def _heatmap_fig(piv: pd.DataFrame, title: str, zlabel: str, zmid: float = 0.0):
-    """px.imshow handles DataFrames natively and renders correctly inside Streamlit tabs."""
-    piv_disp = piv.copy()
-    piv_disp.columns = [f"{c:.2f}" for c in piv_disp.columns]
-    piv_disp.index = [str(i) for i in piv_disp.index]
-    absmax = float(np.abs(piv_disp.values).max()) or 0.1
-    fig = px.imshow(piv_disp, color_continuous_scale="RdBu_r",
-                    color_continuous_midpoint=zmid, zmin=-absmax, zmax=absmax,
-                    labels={"x": "τ", "y": "", "color": zlabel},
-                    text_auto=".2f", aspect="auto")
-    fig.update_layout(title=title, height=340, margin=dict(l=10, r=10, t=40, b=10))
-    fig.update_coloraxes(colorbar_title_text=zlabel)
-    return fig
-
-
-def render_taubacktest_page() -> None:
-    st.title("📐 Backtest τ — deep-dive interactif")
-    st.caption(
-        "Marche chaque marché résolu sur une grille de τ régulière (modèle vs prix CLOB réel vs "
-        "vainqueur final). Génère les données avec `python run_tau_backtest.py` (2j) — voir "
-        "[run_tau_backtest.py](run_tau_backtest.py).")
-
-    dur_label = st.radio("Durée des marchés", list(_TAU_FILES.keys()), horizontal=True)
-    path = _TAU_FILES[dur_label]
-    if not path.exists():
-        st.warning(f"Pas encore généré : `{path}`. Lance `python run_tau_backtest.py` "
-                   f"(adapter `DURATIONS` pour le 7j) puis rafraîchis cette page.")
-        return
-    df = load_tau_backtest(str(path), path.stat().st_mtime)
-    n_mkts = df["slug"].nunique()
-    st.caption(f"{len(df):,} lignes · {n_mkts} marchés résolus · généré "
-              f"{dt.datetime.fromtimestamp(path.stat().st_mtime):%d/%m %H:%M}".replace(",", " "))
-
-    tab_a, tab_b, tab_c, tab_d, tab_e = st.tabs([
-        "🎯 Calibration du leader", "📊 Biais modèle", "💹 Biais marché", "🔍 Explorateur ROI",
-        "🔬 Trajectoire d'un marché"])
-
-    # ---- [A] calibration of the model's own leader pick, over tau ----
-    with tab_a:
-        st.caption("Tranche favorite du modèle (`model_rank==1`) à chaque τ : sa probabilité annoncée "
-                  "tient-elle, et acheter au prix marché (+ spread) rapporte-t-il ?")
-        leader = df[df["model_rank"] == 1]
-        rows = []
-        for tau, g in leader.groupby("tau"):
-            r = _kelly_roi(g)
-            rows.append({"tau": tau, "prob_modele": g["model_prob"].mean(), "win_rate": r["win_rate"],
-                        "roi_flat": r["roi_flat"], "roi_kelly": r["roi_kelly"], "n": r["n"]})
-        cal = pd.DataFrame(rows)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=cal["tau"], y=cal["prob_modele"], name="prob. annoncée (modèle)",
-                                 mode="lines+markers", line=dict(color="#888", dash="dash")))
-        fig.add_trace(go.Scatter(x=cal["tau"], y=cal["win_rate"], name="taux de victoire réel",
-                                 mode="lines+markers", line=dict(color="#1f77b4", width=3)))
-        fig.add_trace(go.Bar(x=cal["tau"], y=cal["roi_flat"], name="ROI flat (axe droit)",
-                             marker_color="#4CAF50", opacity=0.45, yaxis="y2"))
-        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
-                          xaxis_title="τ (avancement de la fenêtre)",
-                          yaxis=dict(title="probabilité / taux de victoire", range=[0, 1]),
-                          yaxis2=dict(title="ROI flat", overlaying="y", side="right", tickformat=".0%"),
-                          legend=dict(orientation="h", y=-0.18), hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True, key="tau_calib_chart")
-        st.dataframe(cal.round(3), use_container_width=True, hide_index=True)
-
-    # ---- [B] structural bias: model_prob - realized, by (tau, position relative to model leader) ----
-    with tab_b:
-        st.caption("Biais = probabilité moyenne du modèle − taux de victoire réel, par position relative "
-                  "au leader du modèle (0) et par τ. **Rouge = le modèle SURévalue** cette position ; "
-                  "**bleu = il la SOUSévalue**. Les chiffres dans chaque case = biais en points de proba.")
-        order = ["≤-3", "-2", "-1", "0 (leader)", "+1", "+2", "≥+3"]
-        grp = df.groupby(["tau", "pos_bucket"])
-        bias = (grp["model_prob"].mean() - grp["is_winner"].mean()).rename("biais").reset_index()
-        piv = bias.pivot(index="pos_bucket", columns="tau", values="biais").reindex(
-            [o for o in order if o in bias["pos_bucket"].unique()])
-        st.plotly_chart(_heatmap_fig(piv, "Biais du modèle (prob − réel) par position et τ", "biais"),
-                        use_container_width=True, key="tau_bias_model")
-        ncount = grp.size().rename("n").reset_index().pivot(index="pos_bucket", columns="tau", values="n")
-        with st.expander("Effectifs (n) par case"):
-            st.dataframe(ncount.reindex(piv.index), use_container_width=True)
-
-    # ---- [C] market mispricing: yes_price - realized, by (tau, market rank) ----
-    with tab_c:
-        st.caption("Biais marché = prix CLOB moyen − taux de victoire réel, par rang de prix du marché "
-                  "(#1 = favori du marché) et par τ. **Rouge = le marché SURpaie** (vendre/NO rentable) ; "
-                  "**bleu = le marché SOUSpaie** (acheter/OUI rentable).")
-        max_rank = st.slider("Rangs affichés (1 = favori marché)", 2, 8, 5, key="tau_c_rank")
-        sub = df[df["market_rank"] <= max_rank]
-        grp_c = sub.groupby(["tau", "market_rank"])
-        bias_c = (grp_c["yes_price"].mean() - grp_c["is_winner"].mean()).rename("biais").reset_index()
-        piv_c = bias_c.pivot(index="market_rank", columns="tau", values="biais").sort_index()
-        st.plotly_chart(_heatmap_fig(piv_c, "Biais du marché (prix − réel) par rang et τ", "biais"),
-                        use_container_width=True, key="tau_bias_market")
-
-    # ---- [D] interactive ROI explorer ----
-    with tab_d:
-        st.caption("Filtre la grille complète et recalcule le ROI en direct : choisis un côté "
-                  "(acheter OUI là où le modèle voit un edge positif, ou acheter NON là où il voit un "
-                  "edge négatif = le marché surpaie), une position, une plage de τ, un seuil d'edge.")
-        c1, c2 = st.columns(2)
-        side = c1.radio("Côté", ["OUI (modèle > marché)", "NON (marché surpaie)"],
-                        horizontal=True, key="tau_d_side")
-        side_key = "OUI" if side.startswith("OUI") else "NON"
-        edge_min = c2.slider("Edge minimum (points de proba)", 1, 20, 5,
-                             format="%d pts", key="tau_d_edge") / 100.0
-        tau_range = st.slider("Plage de τ", 0.05, 0.95, (0.05, 0.95), step=0.05, key="tau_d_range")
-        positions = st.multiselect("Positions (vide = toutes)",
-                                   ["0 (leader)", "-1", "+1", "-2", "+2", "≤-3", "≥+3"],
-                                   default=[], key="tau_d_pos")
-
-        sel = df[(df["tau"] >= tau_range[0]) & (df["tau"] <= tau_range[1])]
-        if positions:
-            sel = sel[sel["pos_bucket"].isin(positions)]
-        sel = sel[sel["edge"] >= edge_min] if side_key == "OUI" else sel[sel["edge"] <= -edge_min]
-
-        r = _kelly_roi(sel, side=side_key)
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Trades", r["n"])
-        k2.metric("Taux de victoire", f"{r['win_rate']*100:.0f}%" if r["n"] else "—")
-        k3.metric("ROI flat", f"{r['roi_flat']*100:+.0f}%" if r["n"] else "—")
-        k4.metric("ROI ¼-Kelly", f"{r['roi_kelly']*100:+.0f}%" if r["n"] else "—")
-
-        if r["n"] >= 5:
-            byt = []
-            for tau_val, g_tau in sel.groupby("tau"):
-                rr = _kelly_roi(g_tau, side=side_key)
-                if rr["n"] >= 3:
-                    byt.append({"tau": tau_val, **rr})
-            if byt:
-                bt = pd.DataFrame(byt)
-                fig_d = go.Figure()
-                fig_d.add_trace(go.Bar(x=bt["tau"], y=bt["roi_flat"], name="ROI flat",
-                                       marker_color="#4CAF50", text=bt["n"], textposition="outside"))
-                fig_d.update_layout(height=320, margin=dict(l=10, r=10, t=20, b=10),
-                                    xaxis_title="τ", yaxis=dict(title="ROI flat", tickformat=".0%"),
-                                    showlegend=False)
-                st.plotly_chart(fig_d, use_container_width=True, key="tau_d_roi_chart")
-                st.caption("Étiquette = nombre de trades dans le bucket τ.")
-        else:
-            st.info("Moins de 5 trades avec ces filtres — élargis la plage ou baisse le seuil d'edge.")
-
-    # ---- [E] single-market trajectory drill-down ----
-    with tab_e:
-        st.caption("Pour un marché donné : trajectoire de la probabilité modèle et du prix marché pour "
-                  "chaque tranche, au fil de τ. La tranche gagnante est mise en évidence.")
-        slugs = sorted(df["slug"].unique(), reverse=True)
-        slug_e = st.selectbox("Marché", slugs, key="tau_e_slug")
-        mdf = df[df["slug"] == slug_e]
-        winner = mdf.loc[mdf["is_winner"], "bracket"].iloc[0] if mdf["is_winner"].any() else None
-        fig_e = go.Figure()
-        for b, g_b in mdf.groupby("bracket"):
-            g_b = g_b.sort_values("tau")
-            is_win = b == winner
-            fig_e.add_trace(go.Scatter(x=g_b["tau"], y=g_b["model_prob"], name=f"{b} · modèle",
-                                       mode="lines", line=dict(width=3 if is_win else 1,
-                                                               color="#1f77b4" if is_win else None),
-                                       legendgroup=b, opacity=1.0 if is_win else 0.35))
-            fig_e.add_trace(go.Scatter(x=g_b["tau"], y=g_b["yes_price"], name=f"{b} · marché",
-                                       mode="lines", line=dict(width=3 if is_win else 1, dash="dot",
-                                                               color="#E8B04C" if is_win else None),
-                                       legendgroup=b, opacity=1.0 if is_win else 0.35))
-        fig_e.update_layout(title=f"{slug_e} — gagnant : {winner}", height=480,
-                            margin=dict(l=10, r=10, t=40, b=10), xaxis_title="τ",
-                            yaxis=dict(title="probabilité", range=[0, 1]),
-                            legend=dict(orientation="h", y=-0.25, font=dict(size=9)))
-        st.plotly_chart(fig_e, use_container_width=True, key="tau_e_traj")
-        st.caption("Trait plein = probabilité modèle · pointillé = prix marché (YES). Bleu/jaune épais "
-                  "= tranche gagnante. Les autres tranches sont grisées en transparence.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1626,87 +990,6 @@ def _auto_archive_bg(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Fade « ancrage +1 » — validated secondary play (docs/STRATEGY.md): after a resolution the crowd
-# overpays the bracket just ABOVE the previous winner; buy NO on it at τ≈0.60.
-# --------------------------------------------------------------------------- #
-_FADE_EXPLANATION = (
-    "**Le mécanisme (mesuré sur 75 paires de marchés consécutifs)** : quand un marché se résout, "
-    "la foule s'ancre *vers le haut* — elle sur-paie la tranche **juste au-dessus de la gagnante "
-    "précédente** (« il va accélérer »), alors qu'Elon **répète** : l'ex-gagnante re-gagne 36% du "
-    "temps (vs ~12% au hasard), et la tranche « +1 » cote ~0.22 en moyenne mais ne gagne que ~11% "
-    "(avril→juil : sur-cote **+11 pts**, en renforcement). \n\n"
-    "**La règle** : à τ≈0.60 (le soir du jour du milieu, en même temps que le check principal), "
-    "**acheter NON** sur cette tranche « +1 » si son prix OUI est entre 0.08 et 0.60. "
-    "Backtest récent (mars→juil) : **81% de réussite, +14,3% de ROI par trade** (n=21, vrais coûts "
-    "NON). C'est une ligne d'appoint : **mise ≤ 5% du bankroll**, tenue à la résolution. "
-    "⚠️ petit échantillon — à re-mesurer tous les mois (re-run du τ-backtest)."
-)
-
-
-@st.cache_data(show_spinner=False, ttl=1800)
-def _prev_winner_2d(before_iso: str) -> str | None:
-    """Winner label of the most recently resolved 2-day market before this instant (from archive)."""
-    con = D._conn()
-    try:
-        row = con.execute("SELECT winner FROM resolved_markets WHERE duration_days<4 AND "
-                          "window_end<=? ORDER BY window_end DESC LIMIT 1", (before_iso,)).fetchone()
-    finally:
-        con.close()
-    return row[0].strip() if row and row[0] else None
-
-
-def _fade_anchor_signal(R: dict) -> dict | None:
-    """Detect the fade-anchor setup on a live 2-day market. Returns None, or a dict with
-    status 'ACTIF' (τ in window & price in band) / 'À VENIR' (before the window)."""
-    if R["summary"]["hours_remaining"] <= 0 or R["duration_days"] >= 4:
-        return None
-    tbl = [r for r in R["table"] if r.get("yes_price") is not None]
-    if len(tbl) < 3:
-        return None
-    prev = _prev_winner_2d((W.utc_ts(R["window_start"]) + pd.Timedelta(minutes=5)).isoformat())
-    if not prev:
-        return None
-    labs = sorted([r["label"].strip() for r in tbl], key=_lo_of_label)
-    if prev not in labs or labs.index(prev) + 1 >= len(labs):
-        return None
-    plus1 = labs[labs.index(prev) + 1]
-    row = next(r for r in tbl if r["label"].strip() == plus1)
-    span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
-    tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
-    yes = float(row["yes_price"])
-    no_px = float(row["no_price"]) if row.get("no_price") is not None else 1.0 - yes
-    in_band = 0.08 <= yes <= 0.60
-    if 0.50 <= tau <= 0.70 and in_band:
-        status = "ACTIF"
-    elif tau < 0.50:
-        status = "À VENIR"
-    else:
-        return None
-    t_check = (W.utc_ts(R["window_start"]) + pd.Timedelta(seconds=span * 0.60)).tz_convert(W.ET)
-    return {"status": status, "prev": prev, "plus1": plus1, "yes": yes, "no": no_px,
-            "tau": tau, "t_check_et": t_check}
-
-
-def render_fade_anchor_section(R: dict) -> None:
-    sig = _fade_anchor_signal(R)
-    if sig is None:
-        return
-    st.markdown("#### 🧲 Signal d'appoint — fade « ancrage +1 »")
-    if sig["status"] == "ACTIF":
-        stake = _load_bankroll() * 0.05
-        st.info(f"**✅ ACTIF** — le marché précédent s'est résolu sur **{sig['prev']}** ; la foule "
-                f"sur-paie historiquement la tranche au-dessus, **{sig['plus1']}** (OUI {sig['yes']:.2f}). "
-                f"→ **ACHETER NON {sig['plus1']} @ ~{min(sig['no']+0.01, 0.99):.2f}**, "
-                f"mise ≤ 5% (${stake:,.0f}), tenir à la résolution.".replace(",", " "))
-    else:
-        st.caption(f"⏳ **À évaluer à τ0.60** ({sig['t_check_et']:%a %d %b %H:%M} ET) : ex-gagnante = "
-                   f"**{sig['prev']}** → candidate au fade : **{sig['plus1']}** "
-                   f"(OUI {sig['yes']:.2f} actuellement ; il faudra 0.08 ≤ prix ≤ 0.60).")
-    with st.expander("ℹ️ Comprendre ce signal (mécanisme + chiffres)"):
-        st.markdown(_FADE_EXPLANATION)
-
-
-# --------------------------------------------------------------------------- #
 # Edge scanner page — every live Elon market (incl. pre-open), every bracket, sorted by edge,
 # annotated with the validated warnings (surge trap, decision window, <40 ticket).
 # --------------------------------------------------------------------------- #
@@ -1733,7 +1016,7 @@ def render_scanner_page() -> None:
                            default=["OUI (modèle > marché)", "NON (marché surpayé)"], key="scan_sides")
 
     _now = dt.datetime.now(dt.timezone.utc)
-    rows, failed, fades = [], [], []
+    rows, failed = [], []
     oldest = None
     prog = st.progress(0.0, text="Scan des marchés…")
     for i, m in enumerate(mkts):
@@ -1746,9 +1029,6 @@ def render_scanner_page() -> None:
             continue
         r_now = W.utc_ts(R["now"])
         oldest = r_now if oldest is None else min(oldest, r_now)
-        _fs = _fade_anchor_signal(R)
-        if _fs is not None:
-            fades.append({**_fs, "range": m["range"]})
         span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
         tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
         pre_open = tau < 0
@@ -1801,22 +1081,6 @@ def render_scanner_page() -> None:
     if failed:
         st.caption("Ignorés : " + " · ".join(failed))
 
-    # ---- rule-based signal: fade « ancrage +1 » (independent of the edge filter) ----
-    st.markdown("##### 🧲 Fade « ancrage +1 » — signal de règle (indépendant du filtre d'edge)")
-    if fades:
-        for s in fades:
-            if s["status"] == "ACTIF":
-                st.success(f"**✅ ACTIF — {s['range']}** : le marché précédent a résolu **{s['prev']}** "
-                           f"→ la foule sur-paie la tranche au-dessus, **{s['plus1']}** "
-                           f"(OUI {s['yes']:.2f}). **ACHETER NON @ ~{min(s['no']+0.01,0.99):.2f}**, "
-                           f"mise ≤5%, tenir à la résolution.")
-            else:
-                st.caption(f"⏳ {s['range']} : à évaluer à τ0.60 ({s['t_check_et']:%a %H:%M} ET) — "
-                           f"ex-gagnante **{s['prev']}**, candidate **{s['plus1']}** (OUI {s['yes']:.2f}).")
-    else:
-        st.caption("Aucun setup fade détecté sur les marchés 2j en cours.")
-    with st.expander("ℹ️ Comprendre le signal fade « ancrage +1 » (mécanisme + chiffres du backtest)"):
-        st.markdown(_FADE_EXPLANATION)
     st.markdown("---")
 
     if not rows:
@@ -1844,6 +1108,140 @@ def render_scanner_page() -> None:
                "sont surestimées par le modèle (+7pts mesurés) — prudence même en vert.")
 
 
+# --------------------------------------------------------------------------- #
+# Strategy page — the backtest-validated plays, live for the open markets.
+# --------------------------------------------------------------------------- #
+def _anchor_fade_setup(R: dict) -> dict | None:
+    """Validated intra-market anchoring fade (7-DAY only): the crowd overpays the bracket just ABOVE
+    the current market favorite ('il va accélérer'), which wins only ~11% while priced ~0.20. Buy NO
+    on it around τ≈0.45, hold to close. Out-of-sample (Nov'25–Jul'26, 2 regimes): win-rate holds
+    ~85-90%, but the edge over base rate is MODEST and τ-dependent (~+3 to +8 pts, thin ROI) — the
+    +16pt recent peak did not fully replicate. A small grinder, not a big edge. 7-DAY only.
+
+    Returns None (not applicable) or a dict with status ACTIF / À VENIR / FENÊTRE PASSÉE / HORS BANDE."""
+    if R["duration_days"] < 4 or R["summary"]["hours_remaining"] <= 0:
+        return None
+    tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+    if len(tbl) < 3:
+        return None
+    labs = sorted(tbl, key=lambda r: _lo_of_label(r["label"]))
+    fav = max(tbl, key=lambda r: r["yes_price"])
+    fi = next(i for i, r in enumerate(labs) if r["label"] == fav["label"])
+    if fi + 1 >= len(labs):
+        return None
+    plus1 = labs[fi + 1]
+    yes = float(plus1["yes_price"])
+    no_px = float(plus1["no_price"]) if plus1.get("no_price") is not None else 1.0 - yes
+    span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
+    tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
+    in_band = 0.05 <= yes <= 0.60
+    if 0.30 <= tau <= 0.65 and in_band:
+        status = "ACTIF"
+    elif tau < 0.30:
+        status = "À VENIR"
+    elif not in_band:
+        status = "HORS BANDE"
+    else:
+        status = "FENÊTRE PASSÉE"
+    t_check = (W.utc_ts(R["window_start"]) + pd.Timedelta(seconds=span * 0.45)).tz_convert(W.ET)
+    return {"status": status, "favorite": fav["label"].strip(), "plus1": plus1["label"].strip(),
+            "yes": yes, "no": no_px, "tau": tau, "t_check_et": t_check,
+            "hours_remaining": R["summary"]["hours_remaining"]}
+
+
+def render_strategy_page() -> None:
+    st.title("🎯 Stratégie — les plays validés au backtest")
+    st.caption("Ce qui gagne réellement sur **156 marchés depuis nov. 2025** (prix minute, contrôlé "
+               "taux-de-base + hors-échantillon sur 2 régimes) : **fader la foule**. Les **taux de "
+               "réussite tiennent**, les gains par trade sont plus modestes hors du régime récent. "
+               "Cette page te dit, pour les marchés ouverts *maintenant*, si un setup est actif.")
+    _refresh_button("refresh_strat", cached_run, list_active_markets, cached_fade_signals)
+    token = st.session_state.get("refresh_strat_token", 0)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fade d'ancrage (7 j)", "≈85–90 % win", "edge modeste +3 à +8 pts vs base (tenu OOS)")
+    c2.metric("Fade de salve (7 j)", "75–94 % win", "gains +7 à +42 %/trade selon régime")
+    c3.metric("Robustesse", "2 régimes", "testé sur 156 marchés depuis nov. 2025")
+    st.caption("⚠️ Les **taux de réussite tiennent** hors-échantillon (nov'25→juil'26) ; les **gros "
+               "gains par trade étaient des pics du régime récent** — attends-toi à des chiffres plus "
+               "modestes. Ce sont des grinders à petite mise, pas des jackpots.")
+
+    try:
+        mkts = list_active_markets("elonmusk")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Marchés actifs indisponibles : {e}")
+        return
+    if not mkts:
+        st.warning("Aucun marché Elon en ligne.")
+        return
+
+    # gather runs once (cached) for both sections
+    anchors, spikes, failed = [], [], []
+    prog = st.progress(0.0, text="Scan des marchés…")
+    for i, m in enumerate(mkts):
+        prog.progress((i + 1) / len(mkts), text=f"Scan {i+1}/{len(mkts)} — {m['range']}")
+        try:
+            R = cached_run(m["slug"], "elonmusk", None, 8000, 28.0, 90.0, None, token,
+                           st.session_state.get("calib_token", 0))
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{m['range']} ({e})")
+            continue
+        a = _anchor_fade_setup(R)
+        if a is not None:
+            anchors.append({**a, "range": m["range"], "dur": m["duration"]})
+        for _sp in cached_fade_signals(m["slug"], "elonmusk", token):
+            spikes.append({**_sp, "range": m["range"]})
+    prog.empty()
+
+    # ---------- 1. Anchoring fade (7-day, hold to close) ----------
+    st.markdown("### 🧲 Fade d'ancrage +1 — 7 jours, tenu à la clôture")
+    st.caption("Achète **NON** sur la tranche juste **au-dessus du favori marché** vers τ≈0,45. Tu ne "
+               "paries pas « moins de tweets » — juste que le total n'atterrit pas dans cette bande "
+               "étroite (un surge la dépasse, ton NON gagne quand même). Mise ≤ 10 %, tenue.")
+    _active = [a for a in anchors if a["status"] == "ACTIF"]
+    if _active:
+        for a in _active:
+            st.success(
+                f"**✅ ACTIF — {a['range']}** · favori **{a['favorite']}** → fade la tranche "
+                f"**{a['plus1']}** : **ACHÈTE NON @ ~{min(a['no']+0.01, 0.99):.2f}** "
+                f"(OUI {a['yes']:.2f}, τ={a['tau']:.2f}, {a['hours_remaining']:.0f} h restantes). "
+                f"Mise ≤ 10 %, tenir à la résolution.")
+    for a in anchors:
+        if a["status"] == "ACTIF":
+            continue
+        if a["status"] == "À VENIR":
+            st.caption(f"⏳ **{a['range']}** : à jouer vers τ0,45 ({a['t_check_et']:%a %H:%M} ET) — "
+                       f"favori **{a['favorite']}**, candidate à fader **{a['plus1']}** "
+                       f"(OUI {a['yes']:.2f}).")
+        else:
+            st.caption(f"➖ {a['range']} : pas de setup ({a['status'].lower()} — "
+                       f"{a['plus1']} à OUI {a['yes']:.2f}).")
+    if not anchors:
+        st.caption("Aucun marché 7 jours en ligne — le fade d'ancrage ne s'applique qu'aux 7 jours.")
+
+    st.markdown("---")
+    # ---------- 2. Salvo fade (intraday, exit ~6h) ----------
+    st.markdown("### ⚡ Fade de salve — intraday, sortie ~6 h")
+    st.caption("Quand une salve d'Elon fait bondir une tranche de ≥8 pts en zone 0,25–0,75, la "
+               "surréaction se corrige. Achète **NON** sur le pic, sors sous ~6 h. Le play le plus "
+               "rentable (75–94 % réussite selon durée, tenu OOS) — mais présence requise.")
+    if spikes:
+        for s in spikes:
+            st.warning(f"**{s['range']} · {s['tranche']}** — {s['sens']} {s['saut']:+.0%} → "
+                       f"**{s['côté']} @ {s['prix_action']:.2f}** (YES live {s['prix_yes']:.2f}). "
+                       "Sortir < 6 h.")
+    else:
+        st.caption("Aucune surréaction intraday en ce moment (pic ≥ +8 % en zone 0,25–0,75).")
+    if failed:
+        st.caption("Marchés ignorés : " + " · ".join(failed))
+
+    st.markdown("---")
+    st.info("⚠️ **Risque connu** : 95 % des pertes des fades = une nouvelle salve d'Elon qui atterrit "
+            "pile dans la bande. **Ne sur-mise jamais près d'un catalyseur** (release, procès, "
+            "lancement) — utilise le prompt « catalyseurs » de la page Analyse marché pour vérifier "
+            "l'actualité avant d'entrer. Régime récent uniquement : à re-backtester chaque mois.")
+
+
 _astate = _archive_singleton()
 if not _astate["started"]:
     _astate["started"] = True
@@ -1856,9 +1254,8 @@ if _ares and not _astate["shown"]:
         st.toast(f"🗄️ {len(_ares['new'])} marché(s) fraîchement clôturé(s) archivé(s) en 1-min "
                  f"({_ares['points_added']:,} points).".replace(",", " "))
 
-page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "🔎 Scanner d'edges", "💼 Mes positions",
-                                    "📈 Historique", "🔬 Diagnostic modèle",
-                                    "📐 Backtest τ"], index=0)
+page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "🔎 Scanner d'edges", "🎯 Stratégie",
+                                    "💼 Mes positions", "📈 Historique"], index=0)
 st.sidebar.markdown("---")
 render_data_sync_sidebar()
 st.sidebar.markdown("---")
@@ -1870,17 +1267,14 @@ st.sidebar.caption(
 if page == "🔎 Scanner d'edges":
     render_scanner_page()
     st.stop()
+if page == "🎯 Stratégie":
+    render_strategy_page()
+    st.stop()
 if page == "💼 Mes positions":
     render_positions_page()
     st.stop()
 if page == "📈 Historique":
     render_history_page()
-    st.stop()
-if page == "🔬 Diagnostic modèle":
-    render_diagnostic_page()
-    st.stop()
-if page == "📐 Backtest τ":
-    render_taubacktest_page()
     st.stop()
 
 st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
@@ -2163,7 +1557,6 @@ if _mypos:
                "ci-dessus). Lecture seule via ton wallet.")
 
 render_decision_section(R)
-render_fade_anchor_section(R)
 render_reliability_section(R)
 
 

@@ -87,7 +87,6 @@ src/tweetanalyst/          # la bibliothèque (le cœur)
   backtest.py / histbacktest.py / pathbacktest.py   # replays & backtests
   strategy.py    # moteur de stratégie multi-marchés (Kelly, gates)
   crowd.py       # analyse de sur-réaction / fade
-  diagnostics.py # goodness-of-fit marché vs modèle (page Diagnostic)
   archive.py     # archivage 1-min des marchés résolus (prix, trades, méta)
   positions.py / history.py / execution.py / sources.py / pipeline.py
 
