@@ -79,6 +79,42 @@ def open_elon_positions(positions: list[dict], now: dt.datetime | None = None) -
     return out
 
 
+def open_positions_for_slug(
+    address: str, slug: str, now: dt.datetime | None = None
+) -> dict[int, dict]:
+    """Wallet's open positions on ONE Elon market, keyed by bracket low-bound (int) for easy joining
+    to a forecast table. Read-only, no model run. Returns {} for an empty address. A bracket held on
+    both YES and NO (rare) keeps only the larger leg by current value."""
+    if not address:
+        return {}
+    raw = open_elon_positions(fetch_positions(address), now=now)
+    out: dict[int, dict] = {}
+    for p in raw:
+        if p.get("eventSlug") != slug:
+            continue
+        bounds = _bracket_bounds_from_title(p.get("title", ""))
+        if bounds is None:
+            continue
+        lo = int(bounds[0])
+        size = float(p.get("size", 0))
+        avg = float(p.get("avgPrice", 0))
+        cur = float(p.get("curPrice", 0))
+        info = {
+            "côté": {"YES": "OUI", "NO": "NON"}.get((p.get("outcome") or "").upper(),
+                                                     (p.get("outcome") or "").upper()),
+            "parts": size,
+            "prix_entrée": avg,
+            "prix_marché": cur,
+            "mise": size * avg,
+            "valeur_actuelle": float(p.get("currentValue", size * cur)),
+            "pnl": float(p.get("cashPnl", size * cur - size * avg)),
+        }
+        if lo in out and out[lo]["valeur_actuelle"] >= info["valeur_actuelle"]:
+            continue
+        out[lo] = info
+    return out
+
+
 def analyze(address: str, n_sims: int = 12000, now: dt.datetime | None = None) -> dict:
     """Return {positions: [...], summary: {...}} comparing the wallet's open Elon bets to the model.
 
@@ -106,7 +142,8 @@ def analyze(address: str, n_sims: int = 12000, now: dt.datetime | None = None) -
                 tbl = next((t for t in run.table
                             if t["low"] <= mid <= (t["high"] if t["high"] != float("inf") else 1e9)),
                            None)
-            rows.append(_row(p, tbl, run.market.title))
+            rows.append(_row(p, tbl, run.market.title,
+                             ws=run.window_start, we=run.window_end))
 
     df_rows = rows
     n = len(df_rows)
@@ -128,7 +165,8 @@ def analyze(address: str, n_sims: int = 12000, now: dt.datetime | None = None) -
     return {"positions": df_rows, "summary": summary}
 
 
-def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None = None) -> dict:
+def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None = None,
+         ws: dt.datetime | None = None, we: dt.datetime | None = None) -> dict:
     size = float(p.get("size", 0))
     avg = float(p.get("avgPrice", 0))
     cur = float(p.get("curPrice", 0))
@@ -164,6 +202,10 @@ def _row(p: dict, tbl: dict | None, market_title: str | None, error: str | None 
 
     return {
         "marché": market_title or p.get("eventSlug", ""),
+        "slug": p.get("eventSlug", ""),
+        "window_start": ws.isoformat() if ws is not None else None,
+        "window_end": we.isoformat() if we is not None else None,
+        "token_id": p.get("asset", ""),  # CLOB token id of the held outcome — needed to place orders
         "tranche": _label_from_title(p.get("title", "")),
         "côté": side,
         "parts": size,

@@ -1,6 +1,8 @@
 """Run the historical backtest against resolved markets and save results + a plot."""
 import sys, warnings, datetime as dt
 warnings.filterwarnings("ignore")
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
 sys.path.insert(0, "src")
 import numpy as np, pandas as pd
 import matplotlib
@@ -19,8 +21,8 @@ print("resolved markets:", len(markets), flush=True)
 taus = tuple(np.round(np.arange(0.0, 0.96, 0.08), 2))
 res = HB.run(posts, markets, taus=taus, n_sims=4000, gamma=1.45)
 
-res.records.to_csv("histbacktest_records.csv", index=False)
-res.by_tau.to_csv("histbacktest_by_tau.csv", index=False)
+res.records.to_csv("backtest_data/historical/histbacktest_records.csv", index=False)
+res.by_tau.to_csv("backtest_data/historical/histbacktest_by_tau.csv", index=False)
 
 pd.set_option("display.width", 200, "display.max_columns", 30)
 print("\n=== PAR INSTANT τ (fraction de la semaine ecoulee) ===", flush=True)
@@ -43,5 +45,5 @@ labs = ax1.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]
 ax1.legend(lines, labs, loc="upper left", fontsize=8)
 plt.title("Fiabilité du modèle vs edge disponible, au fil de la semaine (18 marchés résolus)")
 plt.tight_layout()
-plt.savefig("histbacktest.png", dpi=110)
+plt.savefig("backtest_data/historical/histbacktest.png", dpi=110)
 print("\nsaved: histbacktest_records.csv, histbacktest_by_tau.csv, histbacktest.png", flush=True)

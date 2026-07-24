@@ -74,16 +74,35 @@ print(run.forecast.summary())          # médiane, p5–p95, n_obs, heures resta
 ## Structure
 
 ```
-src/tweetanalyst/
+app.py                     # interface Streamlit (point d'entrée)
+README.md, requirements*.txt
+
+src/tweetanalyst/          # la bibliothèque (le cœur)
   data.py        # XTracker + Gamma, cache SQLite, fenêtre de comptage (DST-safe)
   windows.py     # ET, jour/heure, grille hebdo (backtest)
   intensity.py   # intensité saisonnière jour×heure + niveau bootstrap (récence)
   hawkes.py      # fit EM + simulateur du processus auto-excitant (bursts)
   model.py       # fit + forecast Monte-Carlo + proba par tranche
-  backtest.py    # replay des semaines passées + courbe de calibration
-  pipeline.py    # entrée haut niveau (CLI / app)
-app.py           # interface Streamlit
+  calibration.py # recalibrage γ (sharpening) par durée de marché
+  backtest.py / histbacktest.py / pathbacktest.py   # replays & backtests
+  strategy.py    # moteur de stratégie multi-marchés (Kelly, gates)
+  crowd.py       # analyse de sur-réaction / fade
+  archive.py     # archivage 1-min des marchés résolus (prix, trades, méta)
+  positions.py / history.py / execution.py / sources.py / pipeline.py
+
+scripts/                   # exécutables (à lancer depuis n'importe où)
+  backtests/     # run_*.py  → écrivent dans backtest_data/<catégorie>/
+  analysis/      # analyze_*.py  (post-mortems, dynamique de prix, τ-grid)
+  tools/         # archive_markets, capture_book, snapshot_market, recalibrate, setup_credentials
+
+data/                      # local, git-ignoré : cache.db (posts/prix/trades), wallet.txt
+backtest_data/             # local, git-ignoré : tous les outputs (crowd/, historical/,
+                           #   manual/, path_strategy/, postmortem/, orderbook/, …)
+docs/                      # PHASE2_ACTIVATION.md, notes
 ```
+
+Les scripts s'ancrent automatiquement sur la racine du repo (`os.chdir`) : on peut les lancer
+de partout, p.ex. `python scripts/backtests/run_tau_backtest.py`.
 
 ## Limites / notes
 

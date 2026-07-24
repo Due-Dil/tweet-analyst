@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -15,9 +16,13 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from tweetanalyst import archive as ARCH  # noqa: E402
 from tweetanalyst import backtest as BT  # noqa: E402
 from tweetanalyst import calibration as CAL  # noqa: E402
+from tweetanalyst import crowd as CR  # noqa: E402
 from tweetanalyst import data as D  # noqa: E402
+from tweetanalyst import execution as EXE  # noqa: E402
+from tweetanalyst import history as HIST  # noqa: E402
 from tweetanalyst import model as M  # noqa: E402
 from tweetanalyst import pipeline as P  # noqa: E402
 from tweetanalyst import positions as POS  # noqa: E402
@@ -56,13 +61,210 @@ def _fmt_rel(seconds: float) -> str:
 st.set_page_config(page_title="Elon Tweet Tracker", layout="wide")
 
 
-@st.cache_data(show_spinner="Lecture des positions…", ttl=300)
+def _refresh_button(key: str, *cache_fns) -> None:
+    """Per-page refresh: clears ONLY this page's cached data (live CLOB prices, positions…) and reruns.
+    Other pages stay cached, so navigation between pages never recomputes."""
+    if st.button("🔄 Rafraîchir cette page", key=key, type="primary",
+                 help="Recharge les données live de cette page (prix du carnet d'ordres CLOB, "
+                      "positions…). Les autres pages restent en cache."):
+        for fn in cache_fns:
+            try:
+                fn.clear()
+            except Exception:  # noqa: BLE001
+                pass
+        st.rerun()
+
+
+def _regen_tau_if_needed() -> list[str]:
+    """Regenerate the τ-backtest CSVs (feed the reliability section) only for a market
+    duration that actually gained a resolved market. Mirrors scripts/tools/sync_data.py step 3.
+    Runs the regen with the app's own interpreter (has disk access, unlike the old launchd job)."""
+    import subprocess
+
+    msgs: list[str] = []
+    con = D._conn()
+    try:
+        arch = pd.read_sql_query("SELECT duration_days FROM resolved_markets", con)
+    finally:
+        con.close()
+    for dur, csv in [("2", "backtest_data/tau_backtest_2d.csv"),
+                     ("7", "backtest_data/tau_backtest_7d.csv")]:
+        n_arch = int(((arch["duration_days"] < 4) if dur == "2"
+                      else (arch["duration_days"] >= 4)).sum())
+        n_csv = pd.read_csv(csv)["slug"].nunique() if Path(csv).exists() else 0
+        if n_arch > n_csv:
+            msgs.append(f"τ-backtest {dur}j : {n_csv} → {n_arch} marchés, régénération…")
+            subprocess.run([sys.executable, "scripts/backtests/run_tau_backtest.py", dur],
+                           check=False)
+            msgs.append(f"τ-backtest {dur}j : ✅ régénéré")
+        else:
+            msgs.append(f"τ-backtest {dur}j : à jour ({n_csv} marchés)")
+    return msgs
+
+
+def _n_resolved_same_duration(is_2d: bool) -> int:
+    con = D._conn()
+    try:
+        cond = "duration_days < 4" if is_2d else "duration_days >= 4"
+        return int(con.execute(f"SELECT COUNT(*) FROM resolved_markets WHERE realized IS NOT NULL "
+                               f"AND {cond}").fetchone()[0])
+    finally:
+        con.close()
+
+
+def _historical_bracket_dist(table_rows: list, is_2d: bool, n_recent: int):
+    """Empirical distribution of resolved markets across the CURRENT market's brackets: bins each
+    recent same-duration resolved market's realized final count into these brackets. Returns
+    (fractions aligned to table_rows order, n_markets_used, list of realized totals used)."""
+    con = D._conn()
+    try:
+        cond = "duration_days < 4" if is_2d else "duration_days >= 4"
+        rows = con.execute(f"SELECT realized FROM resolved_markets WHERE realized IS NOT NULL AND "
+                           f"{cond} ORDER BY window_end DESC LIMIT ?", (int(n_recent),)).fetchall()
+    finally:
+        con.close()
+    totals = [int(r[0]) for r in rows]
+    edges = [(float(r["low"]), float(r["high"]) if np.isfinite(r["high"]) else float("inf"))
+             for r in table_rows]
+    counts = [0] * len(edges)
+    for t in totals:
+        for i, (lo, hi) in enumerate(edges):
+            if lo <= t <= hi:
+                counts[i] += 1
+                break
+    n = len(totals)
+    frac = [c / n for c in counts] if n else [0.0] * len(edges)
+    return frac, n, totals
+
+
+def render_data_sync_sidebar() -> None:
+    """Manual replacement for the (disabled) weekly launchd sync: refresh the local historical
+    cache — tweets (XTracker) + freshly-resolved markets (Polymarket) + τ-backtest CSVs — that
+    feeds the model and the backtests. Runs in-process, on demand, on every page."""
+    with st.sidebar:
+        st.markdown("### 🗄️ Données du modèle")
+        st.caption("Met à jour le cache local (tweets + marchés résolus + backtests). "
+                   "À lancer quand tu veux — remplace l'ancien sync auto du lundi. "
+                   "⏱️ Quelques secondes, ou 1-2 min si des grilles de backtest doivent être régénérées.")
+        if st.button("⬇️ Mettre à jour les données", key="manual_data_sync",
+                     use_container_width=True):
+            with st.status("Synchronisation des données…", expanded=True) as _status:
+                try:
+                    st.write("📥 Tweets — récupération incrémentale (XTracker)…")
+                    _posts = D.ensure_history("elonmusk")
+                    _last = _posts["created_at"].max()
+                    st.write(f"→ **{len(_posts):,}** tweets en local · dernier {_last:%d/%m %H:%M} UTC"
+                             .replace(",", " "))
+                    st.write("🗂️ Marchés — archivage des marchés fraîchement résolus (Polymarket)…")
+                    _res = ARCH.archive_recent(handle="elonmusk", lookback=12)
+                    st.write(f"→ {_res['scanned']} scannés · **{len(_res['new'])} nouveaux** · "
+                             f"{_res['skipped']} déjà en stock")
+                    # always reconcile the τ-backtest CSVs against the archive (they can lag even
+                    # when nothing is newly archived this run — e.g. archived by the launch daemon
+                    # in a prior session but never regenerated). Regen only fires per-duration when
+                    # the CSV is actually behind; can take 1-2 min then.
+                    st.write("🔬 Backtests — vérification des grilles τ…")
+                    for _m in _regen_tau_if_needed():
+                        st.write(f"→ {_m}")
+                    st.cache_data.clear()  # force the whole app to recompute on the fresh cache
+                    st.session_state["_data_sync_when"] = dt.datetime.now()
+                    _status.update(label="✅ Données à jour", state="complete", expanded=False)
+                except Exception as e:  # noqa: BLE001
+                    _status.update(label="❌ Échec de la synchronisation", state="error")
+                    st.error(str(e))
+        _when = st.session_state.get("_data_sync_when")
+        if _when:
+            st.caption(f"🕐 Dernière mise à jour manuelle : **{_when:%d/%m à %H:%M}**")
+
+
+@st.cache_data(show_spinner="Lecture des positions…", ttl=None)
 def cached_positions(address: str, n_sims: int, token: int) -> dict:
     return POS.analyze(address, n_sims=n_sims)
 
 
+@st.cache_data(show_spinner="Lecture de l'historique…", ttl=None)
+def cached_history(address: str, token: int) -> dict:
+    return HIST.performance_history(address)
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def cached_slug_positions(address: str, slug: str, token: int) -> dict:
+    """Open positions on a single market, keyed by bracket low-bound. Read-only, no model run.
+    Short TTL (positions change when you trade) + cleared by the page refresh button, so a bet
+    opened mid-session shows up without a full restart."""
+    try:
+        return POS.open_positions_for_slug(address, slug)
+    except Exception:  # noqa: BLE001  (never break the analysis page on a positions read)
+        return {}
+
+
+def render_history_page() -> None:
+    st.title("📈 Mon historique de performance — marchés Elon")
+    _refresh_button("rf_history", cached_history)
+    st.caption(
+        "Toute ta performance sur les marchés « # tweets Elon » : **réalisé** (gains/pertes verrouillés "
+        "sur les parts vendues ou résolues) + **latent** (P&L non réalisé sur tes positions encore "
+        "ouvertes). Reconstruit du flux d'activité Polymarket (achats/ventes + redeems à la résolution) "
+        "par **adresse de wallet** (lecture seule, aucune clé).")
+    wallet = POS.load_wallet()
+    if not wallet:
+        st.info("Renseigne ton wallet (page « Mes positions ») pour voir ton historique.")
+        return
+    try:
+        res = cached_history(wallet, st.session_state.get("pos_token", 0))
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Historique indisponible : {e}")
+        return
+    rows, t = res["rows"], res["totals"]
+    if not rows:
+        st.info("Aucune activité trouvée sur les marchés Elon pour ce wallet.")
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("P&L total", f"${t['total']:+,.0f}",
+              delta=(f"{t['roi']:+.1%} sur investi" if t.get("roi") is not None else None),
+              delta_color="off")
+    m2.metric("Réalisé (clôturé)", f"${t['realized']:+,.0f}")
+    m3.metric("Latent (ouvert)", f"${t['latent']:+,.0f}")
+    m4.metric("Capital investi (cumulé)", f"${t['invested']:,.0f}")
+    m5, m6, m7 = st.columns(3)
+    m5.metric("Marchés joués", f"{t['n_markets']} ({t['n_closed']} clôturés, {t['n_open']} ouverts)")
+    m6.metric("Win-rate (clôturés)", f"{t['win_rate_closed']:.0%}" if t.get("win_rate_closed") is not None else "—")
+    m7.metric("Valeur ouverte actuelle", f"${t['current_value']:,.0f}")
+
+    # cumulative realized P&L over time (closed markets by resolution date)
+    closed = sorted([r for r in rows if not r["is_open"] and r["last_ts"]], key=lambda r: r["last_ts"])
+    if closed:
+        import datetime as _dt
+        xs = [_dt.datetime.fromtimestamp(r["last_ts"], _dt.timezone.utc) for r in closed]
+        cum = np.cumsum([r["realized"] for r in closed])
+        figc = go.Figure()
+        figc.add_scatter(x=xs, y=cum, mode="lines+markers", line_color="#1f77b4", name="réalisé cumulé")
+        figc.add_hline(y=0, line_color="gray", line_width=0.6)
+        figc.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10),
+                           title="P&L réalisé cumulé (marchés clôturés)",
+                           xaxis_title="date de résolution", yaxis_title="$ cumulés")
+        st.plotly_chart(figc, use_container_width=True)
+
+    df = pd.DataFrame([{
+        "Marché": r["label"], "Statut": "🟢 ouvert" if r["is_open"] else "✅ clôturé",
+        "Investi": f"${r['invested']:,.0f}", "Réalisé": f"${r['realized']:+,.1f}",
+        "Latent": (f"${r['latent']:+,.1f}" if r["is_open"] else "—"),
+        "Total": f"${r['total']:+,.1f}", "ROI": (f"{r['roi']:+.0%}" if r.get("roi") is not None else "—"),
+        "Trades": r["n_trades"], "Polymarket": STR.polymarket_url(r["slug"]),
+    } for r in rows])
+    st.dataframe(df, use_container_width=True, hide_index=True,
+                 column_config={"Polymarket": st.column_config.LinkColumn("Marché ↗", display_text="Ouvrir ↗")},
+                 height=min(640, 40 * (len(df) + 1)))
+    st.caption(
+        "**Réalisé** = profit/perte déjà encaissé (ventes + redeems − coût des parts correspondantes). "
+        "**Latent** = P&L non réalisé sur les positions encore ouvertes (mark-to-market). **Total** = "
+        "réalisé + latent. **ROI** = total ÷ capital investi sur ce marché.")
+
+
 def render_positions_page() -> None:
     st.title("💼 Mes positions — alignement avec le modèle")
+    _refresh_button("rf_positions", cached_positions)
     st.caption(
         "Lecture seule de tes positions Polymarket par **adresse de wallet** (publique, aucune clé). "
         "Pour chaque pari Elon ouvert : montant en jeu, P&L, et l'**edge du côté que tu détiens** "
@@ -73,11 +275,7 @@ def render_positions_page() -> None:
                          key="wallet").strip()
     if addr and addr != POS.load_wallet():
         POS.save_wallet(addr)  # remember locally for next time (git-ignored)
-    c1, c2 = st.columns([1, 4])
-    hide_dust = c2.checkbox("Masquer les positions négligeables (< $5)", value=True)
-    if c1.button("🔄 Rafraîchir"):
-        cached_positions.clear()
-        st.session_state.pos_token = st.session_state.get("pos_token", 0) + 1
+    hide_dust = st.checkbox("Masquer les positions négligeables (< $5)", value=True)
     if not addr:
         st.info("Entre ton adresse de wallet (visible sur ton profil Polymarket) pour voir tes positions.")
         return
@@ -107,55 +305,119 @@ def render_positions_page() -> None:
     df = pd.DataFrame(pos)
     if hide_dust:
         df = df[df["valeur_actuelle"] >= 5.0]
-    df = df.sort_values("valeur_actuelle", ascending=False)
-    disp = pd.DataFrame({
-        "Marché": df["marché"].str.replace("Elon Musk # tweets ", "", regex=False),
-        "Tranche": df["tranche"], "Côté": df["côté"],
-        "Mise": df["mise"], "Valeur": df["valeur_actuelle"], "P&L": df["pnl"],
-        "Gain max": df["gain_max"], "Rendement max": df["rendement_max"],
-        "Proba modèle (côté)": df["proba_modèle_côté"], "Edge": df["edge_côté"],
-        "Statut": df["statut"],
-    })
+    if df.empty:
+        st.info("Toutes tes positions sont négligeables (< $5). Décoche le filtre pour les voir.")
+        return
 
-    def _hl(row):
-        if "Réajuster" in str(row["Statut"]):
-            return ["background-color: rgba(220,0,0,0.18)"] * len(row)
-        if "Aligné" in str(row["Statut"]):
-            return ["background-color: rgba(0,170,0,0.16)"] * len(row)
-        return [""] * len(row)
+    # ---- group by market, compute date/state, order chronologically (upcoming/current first) ----
+    _now = dt.datetime.now(dt.timezone.utc)
 
-    sty = (disp.style
-           .format({"Mise": "${:,.0f}", "Valeur": "${:,.0f}", "P&L": "${:,.0f}",
-                    "Gain max": "${:,.0f}", "Rendement max": "{:.0%}",
-                    "Proba modèle (côté)": "{:.1%}", "Edge": "{:+.1%}"}, na_rep="—")
-           .apply(_hl, axis=1))
-    st.dataframe(sty, use_container_width=True, hide_index=True,
-                 height=min(720, 40 * (len(disp) + 1)))
+    def _state(ws_dt, we_dt):
+        if we_dt is None:
+            return "❓ inconnu", 3
+        if _now < ws_dt:
+            return f"🛒 pré-ouverture · démarre dans {_fmt_rel((ws_dt - _now).total_seconds())}", 1
+        if _now < we_dt:
+            return f"🔴 en cours · clôture dans {_fmt_rel((we_dt - _now).total_seconds())}", 0
+        return "🏁 clôturé (à redeem)", 2
+
+    groups = []
+    for slug, g in df.groupby("slug"):
+        ws = g["window_start"].iloc[0]
+        we = g["window_end"].iloc[0]
+        ws_dt = pd.Timestamp(ws).to_pydatetime() if ws else None
+        we_dt = pd.Timestamp(we).to_pydatetime() if we else None
+        label, order = _state(ws_dt, we_dt)
+        date_lbl = _fmt_range(ws_dt, we_dt) if ws_dt and we_dt else g["marché"].iloc[0]
+        groups.append({"slug": slug, "g": g, "ws": ws_dt, "we": we_dt, "state": label,
+                       "order": order, "date": date_lbl,
+                       "val": g["valeur_actuelle"].sum(), "pnl": g["pnl"].sum(),
+                       "mise": g["mise"].sum()})
+    # sort: ongoing → pre-open → settled, then soonest close first within each
+    groups.sort(key=lambda x: (x["order"], x["we"] or dt.datetime.max.replace(tzinfo=dt.timezone.utc)))
+
+    # ---- visual overview: exposure ($) by date, coloured by P&L ----
+    ov = pd.DataFrame([{"date": f"{grp['date']}", "val": grp["val"], "pnl": grp["pnl"]}
+                       for grp in groups])
+    fig = go.Figure(go.Bar(
+        x=ov["val"], y=ov["date"], orientation="h",
+        marker_color=["#2ca02c" if p >= 0 else "#d62728" for p in ov["pnl"]],
+        text=[f"${v:,.0f} · P&L ${p:+,.0f}".replace(",", " ") for v, p in zip(ov["val"], ov["pnl"])],
+        textposition="auto", hoverinfo="skip"))
+    fig.update_layout(height=max(120, 46 * len(ov)), margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis_title="valeur actuelle ($)", yaxis=dict(autorange="reversed"))
+    st.markdown("##### 💰 Exposition par date (vert = en gain, rouge = en perte)")
+    st.plotly_chart(fig, use_container_width=True, key="pos_overview")
+
+    # ---- one card per market/date ----
+    st.markdown("##### 📅 Détail par marché")
+    for grp in groups:
+        g = grp["g"].sort_values("valeur_actuelle", ascending=False)
+        with st.container(border=True):
+            h1, h2, h3 = st.columns([3, 1.4, 1.4])
+            h1.markdown(f"**📅 {grp['date']}**  \n{grp['state']}")
+            h2.metric("Exposé", f"${grp['val']:,.0f}".replace(",", " "))
+            h3.metric("P&L", f"${grp['pnl']:+,.0f}".replace(",", " "),
+                      delta=f"{grp['pnl']/grp['mise']:+.0%}" if grp["mise"] > 0 else None,
+                      delta_color="normal")
+            sub = pd.DataFrame({
+                "Tranche": g["tranche"], "Côté": g["côté"],
+                "Mise": g["mise"], "Valeur": g["valeur_actuelle"], "P&L": g["pnl"],
+                "Proba modèle": g["proba_modèle_côté"], "Edge": g["edge_côté"],
+                "Statut": g["statut"],
+            })
+
+            def _hl(row):
+                s = str(row["Statut"])
+                if "Réajuster" in s:
+                    return ["background-color: rgba(220,0,0,0.16)"] * len(row)
+                if "Aligné" in s:
+                    return ["background-color: rgba(0,170,0,0.14)"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                sub.style.format({"Mise": "${:,.0f}", "Valeur": "${:,.0f}", "P&L": "${:+,.0f}",
+                                  "Proba modèle": "{:.0%}", "Edge": "{:+.0%}"}, na_rep="—").apply(_hl, axis=1),
+                use_container_width=True, hide_index=True)
     st.caption(
-        "**Statut** : compare la proba du modèle pour ton côté au prix de marché de ce côté. "
-        "🟢 **Aligné** = le modèle te donne encore un edge (> +3 pts) → garde. "
-        "🔴 **Réajuster** = le modèle est désormais en-dessous du prix (< −3 pts) → ta position est "
-        "richement valorisée, envisage d'alléger/sortir. ≈ Neutre = pas de signal net."
+        "Groupé par **date de marché** (en cours d'abord, puis pré-ouverture, puis clôturés à redeem). "
+        "🟢 **Aligné** = le modèle te donne encore un edge (> +3 pts) → garde · 🔴 **Réajuster** = modèle "
+        "sous le prix → position richement valorisée, envisage d'alléger/sortir."
     )
 
 
-@st.cache_data(show_spinner="Construction de la stratégie…", ttl=300)
+@st.cache_data(show_spinner="Construction de la stratégie…", ttl=None)
 def cached_strategy(bankroll: float, kelly: float, edge_thr: float, max_sigma: float,
-                    min_obs: int, max_mkt: float, token: int) -> dict:
+                    min_obs: int, max_mkt: float, sizing: str, token: int) -> dict:
     return STR.propose(bankroll=bankroll, kelly_fraction=kelly, edge_threshold=edge_thr,
                        max_sigma_ratio=max_sigma, min_obs=min_obs,
-                       max_per_market_frac=max_mkt, n_sims=12000)
+                       max_per_market_frac=max_mkt, sizing=sizing, n_sims=12000)
 
 
 def render_strategy_page() -> None:
+    # LEGACY — retiré de la navigation (juil. 2026) : ce moteur Kelly multi-marchés continu n'est PAS
+    # la stratégie validée (docs/STRATEGY.md = leader confirmé, encart 🧭 Décision sur Analyse marché).
+    # Conservé pour référence/expérimentation ; ré-ajouter à la radio "📄 Page" pour le réactiver.
     st.title("🎯 Stratégie multi-marchés")
+    _refresh_button("rf_strategy", cached_strategy, cached_positions)
     st.caption(
-        "Plan de paris **dimensionné par Kelly fractionné** sur tous les marchés Elon actifs : pour "
-        "chaque tranche/côté à edge positif, une mise proportionnelle à `edge / (1 − prix)`. "
-        "Garde-fous : on ignore les marchés trop tôt dans leur fenêtre (edge non fiable), on cape "
-        "l'exposition par marché, on plafonne au capital. **Aide à la décision, pas un conseil "
-        "financier** — l'edge du modèle est lui-même incertain."
+        "Plan de paris **dimensionné par Kelly** sur tous les marchés Elon actifs. En mode **joint "
+        "(recommandé)**, les tranches d'un marché sont traitées comme mutuellement exclusives → "
+        "allocation conjointe (course de chevaux) : on mise les tranches sous-cotées et on garde le "
+        "reste en cash, au lieu d'arroser des paris NON corrélés. C'est le sizing validé par le "
+        "backtest (V1_joint). **Aide à la décision, pas un conseil financier.**"
     )
+    cz1, cz2 = st.columns([2, 3])
+    sizing_label = cz1.radio(
+        "Dimensionnement", ["Kelly joint (réaliste)", "Indépendant (legacy, deux côtés)"],
+        index=0, horizontal=False,
+        help="Joint = corrige la corrélation entre tranches (déploie moins, ROI/$ réaliste, YES "
+             "uniquement). Indépendant = ancien comportement deux côtés, qui sur-déploie et gonfle.")
+    sizing = "joint" if sizing_label.startswith("Kelly joint") else "naive"
+    cz2.caption("ℹ️ Le mode **joint** propose **OUI et NON** au meilleur prix réel, mais en allouant "
+                "tout **conjointement** sur l'issue unique (une seule tranche gagne) : paris cohérents "
+                "(plusieurs NON OK, OUI groupés seulement si optimal), corrélation prise en compte. "
+                "Le mode **indépendant** dimensionne chaque pari isolément (sur-déploie).")
     c1, c2, c3 = st.columns(3)
     bankroll = c1.number_input("Capital à déployer ($)", 50, 10_000_000, 1000, step=100)
     kelly = c2.slider("Fraction de Kelly", 0.05, 1.0, 0.25, 0.05,
@@ -173,7 +435,7 @@ def render_strategy_page() -> None:
                              "confiantes de marchés calmes — laisse 0 sauf besoin spécifique.")
     max_mkt = c6.slider("Expo max / marché (%)", 10, 100, 40) / 100
 
-    res = cached_strategy(bankroll, kelly, edge_pts / 100, max_sigma, min_obs, max_mkt,
+    res = cached_strategy(bankroll, kelly, edge_pts / 100, max_sigma, min_obs, max_mkt, sizing,
                           st.session_state.get("calib_token", 0))
     s, bets = res["summary"], res["bets"]
 
@@ -216,69 +478,436 @@ def render_strategy_page() -> None:
                 st.write(f"• **{x['market'].replace('Elon Musk # tweets ', '')}** — {x['reason']}")
 
     # ---- Signals vs current wallet positions ----
-    st.markdown("### Signaux sur tes positions actuelles")
+    st.markdown("### 🎬 Actions à passer (selon le modèle + la stratégie)")
     wallet = POS.load_wallet()
     if not wallet:
         st.info("Renseigne ton wallet (page « Mes positions ») pour comparer ce plan à tes positions "
                 "et obtenir les signaux Entrer / Renforcer / Alléger / Sortir.")
         return
     try:
-        cur = cached_positions(wallet, 12000, st.session_state.get("pos_token", 0))["positions"]
+        posres = cached_positions(wallet, 12000, st.session_state.get("pos_token", 0))
     except Exception as e:  # noqa: BLE001
         st.warning(f"Positions indisponibles: {e}")
         return
+    cur = posres["positions"]
     acts = STR.reconcile(bets, cur)
+    meta_by_slug = {m["slug"]: m for m in res["markets"]}
+
+    def _clean(name: str) -> str:
+        return str(name).replace("Elon Musk # tweets ", "").replace("Elon Musk # of tweets ", "")
+
     if not acts:
         st.info("Aucun signal : pas de position actuelle ni de cible.")
-        return
-    adf = pd.DataFrame(acts)
-    adisp = pd.DataFrame({
-        "Action": adf["action"],
-        "Marché": adf["marché"].astype(str).str.replace("Elon Musk # tweets ", "", regex=False).str[:26],
-        "Tranche": adf["tranche"], "Côté": adf["côté"],
-        "Actuel": adf["valeur_actuelle"], "Cible": adf["cible"],
-        "Edge": adf["edge"], "Pourquoi": adf["raison"],
-    })
+    else:
+        st.caption("🔴 Sortir · 🟠 Alléger · 🟢 Entrer · 🔵 Renforcer · ✅ Conserver. "
+                   "**Prix** et **Proba modèle** sont du côté recommandé (OUI/NON). Clique **Ouvrir ↗** "
+                   "pour passer l'ordre sur Polymarket. Regroupé par marché (durée indiquée).")
+        # group by market (slug), ordered by duration then closing date -> 2-day & 7-day separated
+        def _order_key(slug):
+            m = meta_by_slug.get(slug, {})
+            return (m.get("dur_days") or 99, str(m.get("window_end") or ""))
+        slugs = sorted({a.get("slug") for a in acts if a.get("slug")}, key=_order_key)
+        no_slug = [a for a in acts if not a.get("slug")]
+        for slug in slugs:
+            g = [a for a in acts if a.get("slug") == slug]
+            m = meta_by_slug.get(slug, {})
+            title = _clean(g[0]["marché"] or slug)
+            dur = m.get("dur_days") or g[0].get("dur_days")
+            dur_lbl = f"⏱ {dur:.0f} j" if dur else ""
+            url = STR.polymarket_url(slug)
+            st.markdown(f"**{title}** &nbsp; {dur_lbl} &nbsp;·&nbsp; [↗ Ouvrir sur Polymarket]({url})")
+            gdf = pd.DataFrame([{
+                "Action": a["action"], "Tranche": a["tranche"], "Côté": a["côté"],
+                "Prix": (f"{a['prix']:.2f}" if a.get("prix") is not None else "—"),
+                "Proba modèle": (f"{a['proba_modèle']:.0%}" if a.get("proba_modèle") is not None else "—"),
+                "Edge": (f"{a['edge']:+.1%}" if a.get("edge") is not None else "—"),
+                "Actuel": f"${a['valeur_actuelle']:,.0f}", "Cible": f"${a['cible']:,.0f}",
+                "Pourquoi": a["raison"], "Polymarket": a.get("lien") or "",
+            } for a in g])
+            st.dataframe(gdf, use_container_width=True, hide_index=True,
+                         column_config={"Polymarket": st.column_config.LinkColumn(
+                             "Ordre", display_text="Ouvrir ↗")})
+        if no_slug:
+            st.caption(f"({len(no_slug)} action·s sans marché identifié, ignorées de l'affichage groupé.)")
 
-    def _hl_act(row):
-        a = str(row["Action"])
-        col = {"🔴": "rgba(220,0,0,0.16)", "🟠": "rgba(230,150,0,0.16)",
-               "🟢": "rgba(0,170,0,0.16)", "🔵": "rgba(80,140,230,0.16)"}.get(a[:1], "")
-        return [f"background-color: {col}" if col else ""] * len(row)
+    # ---- Performance tracking on current positions ----
+    st.markdown("### 📊 Suivi de ma performance")
+    psum = posres["summary"]
+    if not cur:
+        st.info("Aucune position Elon ouverte sur ce wallet pour l'instant.")
+    else:
+        mise = psum["mise_totale"]
+        pnl = psum["pnl_total"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Positions", psum["n_positions"])
+        c2.metric("Mise totale (entrée)", f"${mise:,.0f}")
+        c3.metric("Valeur actuelle", f"${psum['valeur_actuelle']:,.0f}")
+        c4.metric("P&L total", f"${pnl:,.0f}",
+                  delta=(f"{pnl/mise:+.1%}" if mise > 0 else None))
+        pdf = pd.DataFrame(cur)
+        perf = pd.DataFrame({
+            "Marché": pdf["marché"].map(_clean), "Tranche": pdf["tranche"], "Côté": pdf["côté"],
+            "Prix entrée": pdf["prix_entrée"].map(lambda x: f"{x:.2f}"),
+            "Prix marché": pdf["prix_marché"].map(lambda x: f"{x:.2f}"),
+            "Mise": pdf["mise"].map(lambda x: f"${x:,.0f}"),
+            "Valeur": pdf["valeur_actuelle"].map(lambda x: f"${x:,.0f}"),
+            "P&L": pdf["pnl"].map(lambda x: f"${x:,.0f}"),
+            "Rendement": (pdf["pnl"] / pdf["mise"].replace(0, np.nan)).map(
+                lambda x: f"{x:+.0%}" if pd.notna(x) else "—"),
+            "Proba modèle (côté)": pdf["proba_modèle_côté"].map(
+                lambda x: f"{x:.0%}" if pd.notna(x) else "—"),
+            "Statut": pdf["statut"],
+            "Polymarket": pdf["slug"].map(STR.polymarket_url),
+        }).sort_values("P&L", ascending=False)
+        st.dataframe(perf, use_container_width=True, hide_index=True,
+                     column_config={"Polymarket": st.column_config.LinkColumn(
+                         "Marché ↗", display_text="Ouvrir ↗")},
+                     height=min(560, 40 * (len(perf) + 1)))
+        st.caption("**Prix entrée** = ton prix d'achat moyen. **P&L** et **Rendement** = gain/perte "
+                   "latent vs ta mise. **Statut** : ✅ Aligné (le modèle te donne encore un edge) · "
+                   "⚠️ Réajuster (le modèle est passé sous ton prix) · ≈ Neutre.")
 
-    st.dataframe(
-        adisp.style.format({"Actuel": "${:,.0f}", "Cible": "${:,.0f}", "Edge": "{:+.1%}"},
-                           na_rep="—").apply(_hl_act, axis=1),
-        use_container_width=True, hide_index=True, height=min(560, 40 * (len(adisp) + 1)))
-    st.caption("🔴 Sortir (le modèle n'y voit plus de valeur) · 🟠 Alléger (au-dessus de la cible) · "
-               "🟢 Entrer (nouvelle opportunité) · 🔵 Renforcer (sous la cible) · ✅ Conserver.")
+    # ---- Value-at-risk: current positions vs the strategy's target portfolio ----
+    st.markdown("### ⚠️ Montants à risque")
+    st.caption(
+        "Tout est en **capital investi** (prix d'entrée × parts pour tes positions, mise pour la "
+        "stratégie). Chaque marché ne fait gagner qu'**une** tranche → P&L discret. On montre les **deux "
+        "côtés** : **Perte probable** = perte non dépassée dans 95% des cas (queue basse) ; **Gain "
+        "probable** = gain atteint dans les 5% meilleurs cas (queue haute) ; **P&L espéré** = moyenne. "
+        "Le **ratio gain/risque** compare les deux queues. Total combiné par simulation des marchés.")
+    brackets_by_slug = {m["slug"]: m.get("brackets", []) for m in res["markets"]}
 
+    def _render_risk(title, risk):
+        t = risk["total"]
+        st.markdown(f"**{title}**")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Capital investi", f"${t['value']:,.0f}")
+        k2.metric("Perte probable (95%)", f"−${t['var95_loss']:,.0f}")
+        k3.metric("Gain probable (95%)", f"+${t['var95_gain']:,.0f}")
+        _e = t["expected_pnl"]
+        k4.metric("P&L espéré", f"${_e:+,.0f}" if _e == _e else "—")  # noqa: PLR0124 (NaN check)
+        _ratio = (t["var95_gain"] / t["var95_loss"]) if t["var95_loss"] > 1e-9 else float("inf")
+        st.caption(
+            f"Risque/récompense : tu risques **−${t['var95_loss']:,.0f}** pour viser **+${t['var95_gain']:,.0f}** "
+            f"(ratio **{_ratio:.1f}×**), espérance **${_e:+,.0f}**. "
+            f"Extrêmes : pire −${t['max_loss']:,.0f} / meilleur +${t['max_gain']:,.0f}.")
+        rows = []
+        for m in risk["per_market"]:
+            _pe = m["expected_pnl"]
+            rows.append({
+                "Marché": _clean((meta_by_slug.get(m["slug"], {}) or {}).get("title", m["slug"])),
+                "Capital investi": f"${m['value']:,.0f}",
+                "Perte (95%)": f"−${m['var95_loss']:,.0f}", "Gain (95%)": f"+${m['var95_gain']:,.0f}",
+                "P&L espéré": (f"${_pe:+,.0f}" if _pe == _pe else "—")})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "💼 Mes positions", "🎯 Stratégie"], index=0)
-if page == "💼 Mes positions":
-    render_positions_page()
-    st.stop()
-if page == "🎯 Stratégie":
-    render_strategy_page()
-    st.stop()
+    # Reason in CAPITAL INVESTED (cost basis = entry price × shares = "mise"), not current value:
+    # if a position loses, the shares go to $0 → you lose what you put in, not today's mark.
+    cur_holdings = [{"slug": r.get("slug"), "tranche": r.get("tranche"), "side": r.get("côté"),
+                     "value": float(r.get("mise", 0) or 0),
+                     "payoff": float(r.get("parts", 0) or 0)} for r in cur]
+    strat_holdings = [{"slug": b["slug"], "tranche": b["tranche"], "side": b["côté"],
+                       "value": float(b["stake"]),
+                       "payoff": (float(b["stake"]) / float(b["prix"]) if b["prix"] else 0.0)}
+                      for b in bets]
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        _render_risk("📍 Mes positions actuelles", STR.portfolio_risk(cur_holdings, brackets_by_slug))
+    with rc2:
+        _render_risk("🎯 Si j'applique la stratégie", STR.portfolio_risk(strat_holdings, brackets_by_slug))
 
-st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
-st.caption(
-    "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
-    "(bursts) + Monte-Carlo de la fin de semaine. Données: xtracker.polymarket.com (source "
-    "de résolution) + Gamma API (tranches & prix live)."
-)
+    # ---- Auto-sell preview (Phase 2 — dry-run; real execution stays disabled) ----
+    st.markdown("### 🤖 Ordres de vente automatiques (aperçu)")
+    live_on = EXE.EXECUTION_ENABLED
+    orders = EXE.build_sell_orders(acts, cur)
+    if not orders:
+        st.info("Aucun ordre de vente : aucune position à **Sortir** ou **Alléger**.")
+    else:
+        ex = EXE.get_executor(live=False)  # always preview here; live runs only via run_autosell(confirm=True)
+        rows = []
+        for o in orders:
+            ex.submit(o)  # dry-run validation/log
+            title = _clean((meta_by_slug.get(o.market_slug, {}) or {}).get("title", o.market_slug))
+            rows.append({"Marché": title, "Tranche": o.bracket_label, "Vendre (parts)": f"{o.shares:g}",
+                         "Prix limite": f"{o.limit_price:.3f}", "Raison": o.reason,
+                         "Polymarket": STR.polymarket_url(o.market_slug)})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                     column_config={"Polymarket": st.column_config.LinkColumn(
+                         "Ordre", display_text="Ouvrir ↗")})
+        st.caption(
+            f"🔒 **Dry-run** — aperçu uniquement, aucun ordre envoyé. Exécution réelle "
+            f"{'**ACTIVÉE**' if live_on else 'désactivée'} (Phase 2 : ventes uniquement, clé dans le "
+            f"trousseau, confirmation par ordre). Voir `PHASE2_ACTIVATION.md`.")
 
 
 # --------------------------------------------------------------------------- #
-@st.cache_data(show_spinner=False, ttl=900)
+# τ-grid backtest CSVs (generated by run_tau_backtest.py) — feed the reliability section below.
+# --------------------------------------------------------------------------- #
+_TAU_FILES = {"2 jours": Path("backtest_data/tau_backtest_2d.csv"),
+              "7 jours": Path("backtest_data/tau_backtest_7d.csv")}
+
+
+# --------------------------------------------------------------------------- #
+# Live model reliability vs history: at the current market's τ, how often did the model's per-bracket
+# probabilities actually come true on past *resolved* markets of the same duration? (calibration lookup)
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, ttl=None)
+def _load_hist_grid(path_str: str, mtime: float) -> pd.DataFrame:
+    return pd.read_csv(path_str)
+
+
+def _hist_file_for_duration(dur: float):
+    key = "2 jours" if dur < 4 else "7 jours"
+    p = _TAU_FILES.get(key)
+    return key, (p if (p and p.exists()) else None)
+
+
+def _bracket_hit_rate(sub: pd.DataFrame, p: float, min_n: int = 15):
+    """Historical realized win-rate for brackets the model rated ≈p at this τ (widen tol until min_n)."""
+    m = sub
+    for tol in (0.07, 0.10, 0.15, 0.25):
+        m = sub[(sub["model_prob"] >= p - tol) & (sub["model_prob"] <= p + tol)]
+        if len(m) >= min_n:
+            return float(m["is_winner"].mean()), len(m)
+    return (float(m["is_winner"].mean()) if len(m) else float("nan")), len(m)
+
+
+def render_reliability_section(R: dict) -> None:
+    """For the current (ongoing) market at its live τ, cross the model's per-bracket probability with
+    the realized hit-rate observed at a comparable τ on resolved markets of the same duration."""
+    st.markdown("### 🎯 Fiabilité du modèle à ce stade (vs historique)")
+    dur = R["duration_days"]
+    span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
+    tau = float(np.clip((W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span, 0, 1))
+    key, path = _hist_file_for_duration(dur)
+    if path is None:
+        st.info(f"Pas encore de backtest historique pour les marchés **{key}**. "
+                f"Lance `run_tau_backtest.py` (avec `DURATIONS` adapté) pour activer cette lecture.")
+        return
+    hist = _load_hist_grid(str(path), path.stat().st_mtime)
+    # Strict, BACKWARD-looking window: the nearest grid checkpoint and the one just before it (two
+    # snapshots, e.g. τ=0.70 & 0.75), never a later one — we don't compare to a more advanced stage
+    # than the live market has actually reached.
+    step = 0.05
+    g = round(tau / step) * step                      # nearest grid checkpoint
+    tau_points = sorted({round(g - step, 3), round(g, 3)})
+    tau_points = [t for t in tau_points if t > 0]     # drop τ≤0 (no data at open)
+    sub = hist[np.isclose(hist["tau"].values[:, None], tau_points, atol=1e-6).any(axis=1)]
+    ckpt_lbl = " & ".join(f"τ={t:.2f}" for t in tau_points)
+    n_mkts = sub["slug"].nunique()
+    if n_mkts < 5:
+        st.info(f"Trop peu de marchés {key} historiques aux checkpoints {ckpt_lbl} pour une lecture fiable.")
+        return
+
+    lead_all = sub[sub["model_rank"] == 1]
+    lead_hit = float(lead_all["is_winner"].mean())
+    top2 = float(sub[sub["model_rank"] <= 2].groupby("slug")["is_winner"].max().mean())
+
+    # current market's own top bracket, and the leader hit-rate CONDITIONED on that confidence level
+    top = max(R["table"], key=lambda r: r["model_prob"])
+    top_p = float(top["model_prob"])
+    cond_hit, cond_n = _bracket_hit_rate(lead_all, top_p, min_n=15)  # leaders rated ≈ top_p at this τ
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("τ actuel", f"{tau:.2f}",
+              help="Avancement du marché en cours (0 = ouverture, 1 = clôture).")
+    c2.metric("Favori du modèle gagne (à ce τ)", f"{lead_hit:.0%}",
+              help=f"Tous favoris confondus : part des {len(lead_all)} cas (sur {n_mkts} marchés {key}) "
+                   "où, à ce même stade, la tranche n°1 du modèle a effectivement gagné.")
+    c3.metric("Top-2 contient le gagnant", f"{top2:.0%}",
+              help="Part des marchés où le gagnant final était dans les 2 tranches les plus probables "
+                   "du modèle à ce stade.")
+
+    # ---- headline callout, tied to the CURRENT top bracket ----
+    cond_txt = (f"a gagné <b>{cond_hit:.0%}</b> du temps (n={cond_n})" if not np.isnan(cond_hit)
+                else "n'a pas assez de comparables historiques")
+    st.markdown(
+        f"<div style='background:rgba(80,140,230,0.16);padding:10px 14px;border-radius:8px'>"
+        f"🏆 <b>Tranche la plus probable maintenant : {top['label']} ({top_p:.0%})</b><br>"
+        f"<span style='font-size:0.95em'>"
+        f"① <b>En ignorant sa confiance</b> — simplement « le favori désigné à ce stade, gagnant ou "
+        f"non » — le favori du modèle à ce τ a été le vrai gagnant <b>{lead_hit:.0%}</b> du temps "
+        f"(n={len(lead_all)}).<br>"
+        f"② <b>En tenant compte de sa confiance</b> (~{top_p:.0%}) : quand le favori était aussi sûr "
+        f"qu'aujourd'hui, il {cond_txt}.<br>"
+        f"<i>Méthode : on rejoue le modèle au même τ sur chaque marché {key} clôturé et on compare à "
+        f"la résolution réelle.</i></span></div>",
+        unsafe_allow_html=True)
+
+    # ---- how the leader behaves by its own confidence band, at this τ (leader calibration) ----
+    bands = pd.cut(lead_all["model_prob"], [0, 0.4, 0.5, 0.6, 0.7, 0.8, 1.01],
+                   labels=["<40%", "40–50%", "50–60%", "60–70%", "70–80%", ">80%"])
+    cal_rows = []
+    for b, gg in lead_all.groupby(bands, observed=True):
+        if len(gg):
+            cal_rows.append({"Confiance du favori": b, "A réellement gagné": float(gg["is_winner"].mean()),
+                             "n": len(gg)})
+    with st.expander(f"📊 Fiabilité du favori selon sa confiance, à ce stade (τ≈{tau:.2f})"):
+        st.dataframe(
+            pd.DataFrame(cal_rows).style.format({"A réellement gagné": "{:.0%}"}),
+            use_container_width=True, hide_index=True)
+        st.caption("Plus le modèle est confiant sur son favori, plus il a raison — et ces taux valident "
+                   "(ou non) le niveau de confiance affiché ci-dessus.")
+
+    rows = []
+    for r in R["table"]:
+        p = float(r["model_prob"])
+        hit, n = _bracket_hit_rate(sub, p)
+        if np.isnan(hit):
+            verdict = "—"
+        elif p - hit > 0.12:
+            verdict = "🟠 modèle sur-confiant"
+        elif hit - p > 0.12:
+            verdict = "🔵 modèle sous-confiant"
+        else:
+            verdict = "🟢 fiable"
+        rows.append({"Tranche": r["label"], "Proba modèle (maintenant)": p,
+                     "Réussite historique (à ce τ)": hit, "n comparables": n, "Lecture": verdict})
+    rel = pd.DataFrame(rows)
+    st.dataframe(
+        rel.style.format({"Proba modèle (maintenant)": "{:.0%}",
+                          "Réussite historique (à ce τ)": "{:.0%}"}, na_rep="—"),
+        use_container_width=True, hide_index=True, height=min(680, 38 * (len(rel) + 1)))
+    st.caption(
+        f"Croisé avec **{n_mkts} marchés {key} résolus**, aux checkpoints **{ckpt_lbl}** (les 2 stades les "
+        f"plus proches du τ actuel de {tau:.2f}, sans jamais regarder un stade plus avancé). *Réussite "
+        "historique* = parmi les tranches que le modèle notait à un niveau de proba comparable **à ce "
+        "stade**, la part qui a réellement gagné. 🟢 la proba tient · 🟠 le modèle promet plus que la "
+        "réalité (surévalue) · 🔵 il est plus prudent que nécessaire (sous-évalue).")
+
+
+# --------------------------------------------------------------------------- #
+# Decision panel — the "leader confirmé" strategy wired live (see docs/STRATEGY.md).
+# 2-day: model prob + directional filter, τ∈[0.55,0.70]. 7-day: ENSEMBLE prob
+# (0.5·model + 0.5·normalized price), τ∈[0.85,0.95], reduced stake.
+# --------------------------------------------------------------------------- #
+_BANKROLL_FILE = Path("data/bankroll.txt")
+
+
+def _load_bankroll() -> float:
+    try:
+        return float(_BANKROLL_FILE.read_text().strip())
+    except Exception:  # noqa: BLE001
+        return 1000.0
+
+
+def _lo_of_label(lab: str) -> float:
+    lab = (lab or "").strip()
+    if lab.startswith("<"):
+        return 0.0
+    if lab.endswith("+"):
+        return float(lab[:-1])
+    try:
+        return float(lab.split("-")[0])
+    except Exception:  # noqa: BLE001
+        return 1e9
+
+
+def render_decision_section(R: dict) -> None:
+    st.markdown("### 🧭 Décision — stratégie « leader confirmé »")
+    if R["summary"]["hours_remaining"] <= 0:
+        st.caption("Marché réglé — plus de décision à prendre.")
+        return
+    dur = R["duration_days"]
+    is2d = dur < 4
+    span = (W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds()
+    tau = float(np.clip((W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / max(span, 1), 0, 1))
+    lo_t, hi_t = (0.55, 0.70) if is2d else (0.85, 0.95)
+
+    tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+    if len(tbl) < 3:
+        st.info("Prix marché indisponibles — décision impossible.")
+        return
+    psum = sum(r["yes_price"] for r in tbl) or 1.0
+    dec = []
+    for r in tbl:
+        q = r["yes_price"] / max(psum, 0.2)
+        dec.append({**r, "p_dec": r["model_prob"] if is2d else 0.5 * r["model_prob"] + 0.5 * q})
+    dec.sort(key=lambda r: -r["p_dec"])
+    lead, second = dec[0], dec[1]
+    mkt_fav = max(dec, key=lambda r: r["yes_price"])
+    edge = lead["p_dec"] - lead["yes_price"]
+    conf_min, edge_min = (0.45, 0.05) if is2d else (0.45, 0.025)
+    plabel = "proba modèle" if is2d else "proba ensemble (½ modèle + ½ prix)"
+
+    gates = [
+        (f"Fenêtre de décision τ∈[{lo_t:.2f}, {hi_t:.2f}]", lo_t <= tau <= hi_t, f"τ = {tau:.2f}"),
+        (f"{plabel} du favori ≥ {conf_min:.0%}", lead["p_dec"] >= conf_min, f"{lead['p_dec']:.0%} ({lead['label']})"),
+        (f"Edge ≥ {edge_min*100:.1f} pts", edge >= edge_min, f"{edge:+.1%}"),
+        ("Prix OUI ≤ 0.80", lead["yes_price"] <= 0.80, f"{lead['yes_price']:.2f}"),
+        ("Direction : favori modèle = ou > favori marché",
+         _lo_of_label(lead["label"]) >= _lo_of_label(mkt_fav["label"]),
+         f"{lead['label']} vs {mkt_fav['label']} (marché)"),
+    ]
+    all_ok = all(ok for _, ok, _ in gates)
+
+    gdf = pd.DataFrame([{"": "✅" if ok else "❌", "Condition": name, "Valeur": val}
+                        for name, ok, val in gates])
+    st.dataframe(gdf, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    bankroll = c1.number_input("Bankroll ($)", min_value=50.0, max_value=1e7,
+                               value=_load_bankroll(), step=100.0, key="dec_bankroll")
+    try:  # persist across sessions
+        if abs(bankroll - _load_bankroll()) > 1e-9:
+            _BANKROLL_FILE.write_text(str(bankroll))
+    except Exception:  # noqa: BLE001
+        pass
+    frac_lab = c2.radio("Mise (protocole : 5% les 20 premiers trades)",
+                        ["5%", "10%"], horizontal=True, key="dec_frac")
+    frac = 0.05 if frac_lab == "5%" or not is2d else 0.10   # 7j = ligne secondaire, 5% max
+
+    if not all_ok:
+        if tau < lo_t:
+            t_open = (W.utc_ts(R["window_start"]) + pd.Timedelta(seconds=span * lo_t))
+            t_et = t_open.tz_convert(W.ET)
+            st.info(f"⏳ **Trop tôt** — la fenêtre de décision ouvre à **{t_et:%a %d %b %H:%M} ET** "
+                    f"(τ={lo_t}). Reviens à ce moment-là ; d'ici là, ne rien faire.")
+        elif tau > hi_t:
+            st.warning("⌛ **Fenêtre de décision passée** — on n'entre plus sur ce marché "
+                       "(entrer tard dégrade fortement l'edge mesuré). Attendre le prochain.")
+        else:
+            failed = " · ".join(name for name, ok, _ in gates if not ok)
+            st.error(f"❌ **PASSER ce marché** — condition(s) non satisfaite(s) : {failed}. "
+                     "Ne pas forcer : ~60% des marchés ne qualifient pas, c'est normal.")
+        return
+
+    # qualified → build the order ticket(s)
+    stake = bankroll * frac
+    if is2d and lead["p_dec"] < 0.75:
+        wtot = lead["p_dec"] + second["p_dec"]
+        legs = [(lead, stake * lead["p_dec"] / wtot), (second, stake * second["p_dec"] / wtot)]
+        mode = f"PANIER TOP-2 (leader à {lead['p_dec']:.0%} < 75% → on assure la tranche n°2)"
+    else:
+        legs = [(lead, stake)]
+        mode = ("TOP-1" if is2d else "TOP-1 (7j, ensemble)") + f" — favori à {lead['p_dec']:.0%}"
+    rows = []
+    for r, amt in legs:
+        pe = min(r["yes_price"] + 0.015, 0.999)
+        rows.append({"Ordre": "ACHETER OUI", "Tranche": r["label"],
+                     "Prix limite ≈": f"{min(r['yes_price'] + 0.01, 0.99):.2f}",
+                     "Montant": f"${amt:,.0f}".replace(",", " "),
+                     "Parts ≈": f"{amt / pe:,.0f}".replace(",", " ")})
+    st.success(f"✅ **ACHETER — {mode}** · mise totale ${stake:,.0f} ({frac:.0%} du bankroll)".replace(",", " "))
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Puis **tenir jusqu'à la résolution** — pas de moyennage, pas de sortie anticipée "
+               "(option : si ta tranche cote ≥0.95 à τ0.90, tu peux vendre pour éliminer le risque "
+               "de bord). Règles et backtests : docs/STRATEGY.md.")
+
+
+# --------------------------------------------------------------------------- #
+# Cached heavy computations (ttl=None → persist across reruns; each page's "🔄 Rafraîchir" button
+# clears ONLY its own cache, so navigating between pages never recomputes).
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, ttl=None)
 def market_duration(slug: str, handle: str) -> float:
     m = D.get_market(slug)
     ws, we = D.resolve_window(slug, m, handle)
     return (we - ws).total_seconds() / 86400.0
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=None)
 def list_active_markets(handle: str) -> list[dict]:
     """Open markets, sorted by close date (soonest first), with readable labels."""
     now = dt.datetime.now(dt.timezone.utc)
@@ -290,12 +919,14 @@ def list_active_markets(handle: str) -> list[dict]:
                 "slug": D.slug_from_url(tw.market_link),
                 "range": _fmt_range(tw.start, tw.end),
                 "duration": dur,
+                "start": tw.start,
                 "end": tw.end,
             })
     return sorted(out, key=lambda m: m["end"])  # closest close first
 
 
-@st.cache_data(show_spinner=True, ttl=600)
+@st.cache_data(show_spinner="⏳ Recalcul du modèle pour ce marché (fit + simulations + prix live, ~10-30 s)…",
+               ttl=None)
 def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
                half_life: float, fit_days: float, gamma: float | None,
                refresh_token: int = 0, calib_token: int = 0) -> dict:
@@ -306,11 +937,13 @@ def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
     conf = M.confidence_report(run.table, run.forecast.samples,
                                run.forecast.summary()["hours_remaining"])
     daily = M.daily_forecast(run.fit, run.window_start, run.window_end)
+    hourly = M.hourly_forecast(run.fit, run.window_start, run.window_end)
     duration_days = (run.window_end - run.window_start).total_seconds() / 86400.0
     # repackage to a cacheable dict (avoid caching heavy objects with live handles)
     return {
         "confidence": conf,
         "daily": daily,
+        "hourly": hourly,
         "gamma_applied": run.gamma,
         "duration_days": duration_days,
         "title": run.market.title,
@@ -329,36 +962,394 @@ def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
     }
 
 
+@st.cache_data(show_spinner=False, ttl=None)
+def cached_fade_signals(slug: str, handle: str, refresh_token: int = 0) -> list:
+    # Live overreaction alerts: brackets that just spiked up into the mid-price fade zone.
+    try:
+        return CR.detect_fade_signals(slug, handle=handle)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# --------------------------------------------------------------------------- #
+# Auto-archive: on app launch, capture any freshly-closed market at 1-min fidelity in a background
+# daemon thread (non-blocking). Runs once per session; near-instant after the first pass since already
+# archived markets are skipped. Protects the backtest DB against Polymarket's limited price retention.
+# --------------------------------------------------------------------------- #
+@st.cache_resource
+def _archive_singleton() -> dict:
+    # process-global (survives reruns & sessions) so the archiver fires once, not per rerun
+    return {"started": False, "result": None, "shown": False}
+
+
+def _auto_archive_bg(state: dict) -> None:
+    try:
+        state["result"] = ARCH.archive_recent(handle="elonmusk", lookback=12)
+    except Exception as e:  # noqa: BLE001
+        state["result"] = {"error": str(e)}
+
+
+# --------------------------------------------------------------------------- #
+# Edge scanner page — every live Elon market (incl. pre-open), every bracket, sorted by edge,
+# annotated with the validated warnings (surge trap, decision window, <40 ticket).
+# --------------------------------------------------------------------------- #
+def render_scanner_page() -> None:
+    st.title("🔎 Scanner d'edges — tous les marchés en ligne")
+    st.caption("Pour chaque marché Elon **ouvert ou pré-ouverture** : proba modèle vs prix live de "
+               "chaque tranche. Filtre par edge minimum. ⚠️ Un gros edge n'est pas toujours une "
+               "opportunité — les pièges connus (backtests) sont annotés sur chaque ligne.")
+    _refresh_button("refresh_scan", cached_run, list_active_markets)
+    token = st.session_state.get("refresh_scan_token", 0)
+
+    try:
+        mkts = list_active_markets("elonmusk")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Marchés actifs indisponibles : {e}")
+        return
+    if not mkts:
+        st.warning("Aucun marché Elon en ligne.")
+        return
+
+    c1, c2 = st.columns([2, 2])
+    edge_min = c1.slider("Edge minimum (points)", 5, 40, 25, key="scan_edge") / 100.0
+    sides = c2.multiselect("Côté", ["OUI (modèle > marché)", "NON (marché surpayé)"],
+                           default=["OUI (modèle > marché)", "NON (marché surpayé)"], key="scan_sides")
+
+    _now = dt.datetime.now(dt.timezone.utc)
+    rows, failed = [], []
+    oldest = None
+    prog = st.progress(0.0, text="Scan des marchés…")
+    for i, m in enumerate(mkts):
+        prog.progress((i + 1) / len(mkts), text=f"Scan {i+1}/{len(mkts)} — {m['range']}")
+        try:
+            R = cached_run(m["slug"], "elonmusk", None, 8000, 28.0, 90.0, None, token,
+                           st.session_state.get("calib_token", 0))
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{m['range']} ({e})")
+            continue
+        r_now = W.utc_ts(R["now"])
+        oldest = r_now if oldest is None else min(oldest, r_now)
+        span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
+        tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
+        pre_open = tau < 0
+        dur = R["duration_days"]
+        state = ("🛒 pré-ouv." if pre_open else f"τ={min(tau,1):.2f}")
+        tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+        if not tbl:
+            continue
+        fav_lo = _lo_of_label(max(tbl, key=lambda r: r["yes_price"])["label"])
+        lowest_lo = min(_lo_of_label(r["label"]) for r in tbl)
+        for r in tbl:
+            e_yes = r["model_prob"] - r["yes_price"]
+            no_px = r.get("no_price") if r.get("no_price") is not None else 1 - r["yes_price"]
+            e_no = (1 - r["model_prob"]) - no_px
+            for side, e, px in [("OUI", e_yes, r["yes_price"]), ("NON", e_no, no_px)]:
+                if e < edge_min:
+                    continue
+                if side == "OUI" and "OUI (modèle > marché)" not in sides:
+                    continue
+                if side == "NON" and "NON (marché surpayé)" not in sides:
+                    continue
+                lo = _lo_of_label(r["label"])
+                warn = ""
+                if side == "OUI" and lo < fav_lo:
+                    warn = "⚠️ PIÈGE : sous le favori marché (surge sous-estimé, ~21% win hist.)"
+                    if lo == lowest_lo and pre_open and px <= 0.12:
+                        warn = "🎟️ billet <40 : jouable en revente 2.5-3×, JAMAIS tenu"
+                elif dur < 4 and 0 <= tau < 0.55:
+                    warn = "⏳ avant la fenêtre de décision 2j (τ 0.55-0.70)"
+                elif dur < 4 and pre_open and side == "OUI":
+                    warn = "⏳ pré-ouverture — la stratégie cœur n'entre qu'à τ 0.55-0.70"
+                elif dur >= 4 and tau < 0.85:
+                    warn = "⏳ 7j : jouable seulement le dernier jour (τ 0.85-0.95, proba ensemble)"
+                elif side == "NON":
+                    warn = "fade : edge mince après coût réel du NON (+2.6c)"
+                rows.append({
+                    "Marché": f"{m['range']} · {m['duration']:.0f}j · {state}",
+                    "Tranche": r["label"], "Côté": side,
+                    "Proba modèle": r["model_prob"], "Prix": px, "Edge": e,
+                    "Avertissement": warn, "_e": e,
+                })
+    prog.empty()
+    if oldest is not None:
+        age_min = (pd.Timestamp(_now) - oldest).total_seconds() / 60
+        if age_min > 15:
+            st.warning(f"⚠️ Données calculées il y a **{age_min:.0f} min** (probas ET prix) — "
+                       "clique **🔄 Rafraîchir cette page** en haut pour un scan frais.")
+        else:
+            st.caption(f"🕐 Calculé il y a {age_min:.0f} min (probas modèle + prix live du carnet).")
+    if failed:
+        st.caption("Ignorés : " + " · ".join(failed))
+
+    st.markdown("---")
+
+    if not rows:
+        st.info(f"Aucune tranche avec un edge ≥ {edge_min:.0%} sur {len(mkts)} marchés scannés. "
+                "Baisse le seuil — ou c'est simplement qu'il n'y a rien à faire aujourd'hui (fréquent).")
+        return
+    sdf = pd.DataFrame(rows).sort_values("_e", ascending=False).drop(columns="_e")
+
+    def _hl(row):
+        w = row["Avertissement"]
+        if w.startswith("⚠️"):
+            return ["background-color: rgba(220,60,60,0.15)"] * len(row)
+        if w.startswith("🎟️"):
+            return ["background-color: rgba(230,170,0,0.15)"] * len(row)
+        if w.startswith("⏳"):
+            return ["background-color: rgba(150,150,150,0.12)"] * len(row)
+        return ["background-color: rgba(0,170,0,0.14)"] * len(row)
+
+    st.dataframe(
+        sdf.style.format({"Proba modèle": "{:.0%}", "Prix": "{:.3f}", "Edge": "{:+.0%}"}).apply(_hl, axis=1),
+        use_container_width=True, hide_index=True, height=min(700, 38 * (len(sdf) + 1)))
+    st.caption("🟢 vert = edge « propre » (aucun piège connu) · 🔴 rouge = piège surge validé par "
+               "backtest (le marché a raison ~4×/5) · 🟡 billet <40 (optionalité, pas résolution) · "
+               "⚪️ gris = hors fenêtre de décision. Les probas des tranches basses en régime calme "
+               "sont surestimées par le modèle (+7pts mesurés) — prudence même en vert.")
+
+
+# --------------------------------------------------------------------------- #
+# Strategy page — the backtest-validated plays, live for the open markets.
+# --------------------------------------------------------------------------- #
+def _anchor_fade_setup(R: dict) -> dict | None:
+    """Validated intra-market anchoring fade (7-DAY only): the crowd overpays the bracket just ABOVE
+    the current market favorite ('il va accélérer'), which wins only ~11% while priced ~0.20. Buy NO
+    on it around τ≈0.45, hold to close. Out-of-sample (Nov'25–Jul'26, 2 regimes): win-rate holds
+    ~85-90%, but the edge over base rate is MODEST and τ-dependent (~+3 to +8 pts, thin ROI) — the
+    +16pt recent peak did not fully replicate. A small grinder, not a big edge. 7-DAY only.
+
+    Returns None (not applicable) or a dict with status ACTIF / À VENIR / FENÊTRE PASSÉE / HORS BANDE."""
+    if R["duration_days"] < 4 or R["summary"]["hours_remaining"] <= 0:
+        return None
+    tbl = [r for r in R["table"] if r.get("yes_price") is not None]
+    if len(tbl) < 3:
+        return None
+    labs = sorted(tbl, key=lambda r: _lo_of_label(r["label"]))
+    fav = max(tbl, key=lambda r: r["yes_price"])
+    fi = next(i for i, r in enumerate(labs) if r["label"] == fav["label"])
+    if fi + 1 >= len(labs):
+        return None
+    plus1 = labs[fi + 1]
+    yes = float(plus1["yes_price"])
+    no_px = float(plus1["no_price"]) if plus1.get("no_price") is not None else 1.0 - yes
+    span = max((W.utc_ts(R["window_end"]) - W.utc_ts(R["window_start"])).total_seconds(), 1.0)
+    tau = (W.utc_ts(R["now"]) - W.utc_ts(R["window_start"])).total_seconds() / span
+    in_band = 0.05 <= yes <= 0.60
+    if 0.30 <= tau <= 0.65 and in_band:
+        status = "ACTIF"
+    elif tau < 0.30:
+        status = "À VENIR"
+    elif not in_band:
+        status = "HORS BANDE"
+    else:
+        status = "FENÊTRE PASSÉE"
+    t_check = (W.utc_ts(R["window_start"]) + pd.Timedelta(seconds=span * 0.45)).tz_convert(W.ET)
+    return {"status": status, "favorite": fav["label"].strip(), "plus1": plus1["label"].strip(),
+            "yes": yes, "no": no_px, "tau": tau, "t_check_et": t_check,
+            "hours_remaining": R["summary"]["hours_remaining"]}
+
+
+def render_strategy_page() -> None:
+    st.title("🎯 Stratégie — les plays validés au backtest")
+    st.caption("Ce qui gagne réellement sur **156 marchés depuis nov. 2025** (prix minute, contrôlé "
+               "taux-de-base + hors-échantillon sur 2 régimes) : **fader la foule**. Les **taux de "
+               "réussite tiennent**, les gains par trade sont plus modestes hors du régime récent. "
+               "Cette page te dit, pour les marchés ouverts *maintenant*, si un setup est actif.")
+    _refresh_button("refresh_strat", cached_run, list_active_markets, cached_fade_signals)
+    token = st.session_state.get("refresh_strat_token", 0)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Fade d'ancrage (7 j)", "≈85–90 % win", "edge modeste +3 à +8 pts vs base (tenu OOS)")
+    c2.metric("Fade de salve (7 j)", "75–94 % win", "gains +7 à +42 %/trade selon régime")
+    c3.metric("Robustesse", "2 régimes", "testé sur 156 marchés depuis nov. 2025")
+    st.caption("⚠️ Les **taux de réussite tiennent** hors-échantillon (nov'25→juil'26) ; les **gros "
+               "gains par trade étaient des pics du régime récent** — attends-toi à des chiffres plus "
+               "modestes. Ce sont des grinders à petite mise, pas des jackpots.")
+
+    try:
+        mkts = list_active_markets("elonmusk")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Marchés actifs indisponibles : {e}")
+        return
+    if not mkts:
+        st.warning("Aucun marché Elon en ligne.")
+        return
+
+    # gather runs once (cached) for both sections
+    anchors, spikes, failed = [], [], []
+    prog = st.progress(0.0, text="Scan des marchés…")
+    for i, m in enumerate(mkts):
+        prog.progress((i + 1) / len(mkts), text=f"Scan {i+1}/{len(mkts)} — {m['range']}")
+        try:
+            R = cached_run(m["slug"], "elonmusk", None, 8000, 28.0, 90.0, None, token,
+                           st.session_state.get("calib_token", 0))
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{m['range']} ({e})")
+            continue
+        a = _anchor_fade_setup(R)
+        if a is not None:
+            anchors.append({**a, "range": m["range"], "dur": m["duration"]})
+        for _sp in cached_fade_signals(m["slug"], "elonmusk", token):
+            spikes.append({**_sp, "range": m["range"]})
+    prog.empty()
+
+    # ---------- 1. Anchoring fade (7-day, hold to close) ----------
+    st.markdown("### 🧲 Fade d'ancrage +1 — 7 jours, tenu à la clôture")
+    st.caption("Achète **NON** sur la tranche juste **au-dessus du favori marché** vers τ≈0,45. Tu ne "
+               "paries pas « moins de tweets » — juste que le total n'atterrit pas dans cette bande "
+               "étroite (un surge la dépasse, ton NON gagne quand même). Mise ≤ 10 %, tenue.")
+    _active = [a for a in anchors if a["status"] == "ACTIF"]
+    if _active:
+        for a in _active:
+            st.success(
+                f"**✅ ACTIF — {a['range']}** · favori **{a['favorite']}** → fade la tranche "
+                f"**{a['plus1']}** : **ACHÈTE NON @ ~{min(a['no']+0.01, 0.99):.2f}** "
+                f"(OUI {a['yes']:.2f}, τ={a['tau']:.2f}, {a['hours_remaining']:.0f} h restantes). "
+                f"Mise ≤ 10 %, tenir à la résolution.")
+    for a in anchors:
+        if a["status"] == "ACTIF":
+            continue
+        if a["status"] == "À VENIR":
+            st.caption(f"⏳ **{a['range']}** : à jouer vers τ0,45 ({a['t_check_et']:%a %H:%M} ET) — "
+                       f"favori **{a['favorite']}**, candidate à fader **{a['plus1']}** "
+                       f"(OUI {a['yes']:.2f}).")
+        else:
+            st.caption(f"➖ {a['range']} : pas de setup ({a['status'].lower()} — "
+                       f"{a['plus1']} à OUI {a['yes']:.2f}).")
+    if not anchors:
+        st.caption("Aucun marché 7 jours en ligne — le fade d'ancrage ne s'applique qu'aux 7 jours.")
+
+    st.markdown("---")
+    # ---------- 2. Salvo fade (intraday, exit ~6h) ----------
+    st.markdown("### ⚡ Fade de salve — intraday, sortie ~6 h")
+    st.caption("Quand une salve d'Elon fait bondir une tranche de ≥8 pts en zone 0,25–0,75, la "
+               "surréaction se corrige. Achète **NON** sur le pic, sors sous ~6 h. Le play le plus "
+               "rentable (75–94 % réussite selon durée, tenu OOS) — mais présence requise.")
+    if spikes:
+        for s in spikes:
+            st.warning(f"**{s['range']} · {s['tranche']}** — pic {s['saut']:+.0%} → "
+                       f"**{s['côté']} @ {s['prix_no']:.2f}** (YES live {s['prix_yes']:.2f}). "
+                       "Sortir < 6 h.")
+    else:
+        st.caption("Aucune surréaction intraday en ce moment (pic ≥ +8 % en zone 0,25–0,75).")
+    if failed:
+        st.caption("Marchés ignorés : " + " · ".join(failed))
+
+    st.markdown("---")
+    st.info("⚠️ **Risque connu** : 95 % des pertes des fades = une nouvelle salve d'Elon qui atterrit "
+            "pile dans la bande. **Ne sur-mise jamais près d'un catalyseur** (release, procès, "
+            "lancement) — utilise le prompt « catalyseurs » de la page Analyse marché pour vérifier "
+            "l'actualité avant d'entrer. Régime récent uniquement : à re-backtester chaque mois.")
+
+
+_astate = _archive_singleton()
+if not _astate["started"]:
+    _astate["started"] = True
+    threading.Thread(target=_auto_archive_bg, args=(_astate,), daemon=True).start()
+
+_ares = _astate["result"]
+if _ares and not _astate["shown"]:
+    _astate["shown"] = True
+    if _ares.get("new"):
+        st.toast(f"🗄️ {len(_ares['new'])} marché(s) fraîchement clôturé(s) archivé(s) en 1-min "
+                 f"({_ares['points_added']:,} points).".replace(",", " "))
+
+page = st.sidebar.radio("📄 Page", ["📊 Analyse marché", "🔎 Scanner d'edges", "🎯 Stratégie",
+                                    "💼 Mes positions", "📈 Historique"], index=0)
+st.sidebar.markdown("---")
+render_data_sync_sidebar()
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Chaque page a son bouton **🔄 Rafraîchir cette page** (en haut). Les données restent en cache "
+    "entre les visites → navigation instantanée, **aucun recalcul** en changeant de page. Rafraîchis "
+    "une page pour des prix du carnet d'ordres **live**.")
+
+if page == "🔎 Scanner d'edges":
+    render_scanner_page()
+    st.stop()
+if page == "🎯 Stratégie":
+    render_strategy_page()
+    st.stop()
+if page == "💼 Mes positions":
+    render_positions_page()
+    st.stop()
+if page == "📈 Historique":
+    render_history_page()
+    st.stop()
+
+st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
+_refresh_button("rf_market", cached_run, list_active_markets, cached_fade_signals,
+                cached_slug_positions)
+st.caption(
+    "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
+    "(bursts) + Monte-Carlo de la fin de semaine. Données: xtracker.polymarket.com (source "
+    "de résolution) + prix du **carnet d'ordres CLOB live** (midpoint, source de vérité)."
+)
+
+
 # --------------------------------------------------------------------------- #
 # Sidebar controls
 # --------------------------------------------------------------------------- #
 st.sidebar.header("Paramètres")
 handle = st.sidebar.text_input("Compte (handle)", value="elonmusk")
 
+# --------------------------------------------------------------------------- #
+# Market picker (main area) — grouped by duration, stable slug-keyed selection
+# --------------------------------------------------------------------------- #
 try:
     markets = list_active_markets(handle)
 except Exception as e:  # noqa: BLE001
     markets = []
-    st.sidebar.warning(f"Marchés actifs indisponibles: {e}")
+    st.warning(f"Marchés actifs indisponibles: {e}")
 
-mode = st.sidebar.radio("Marché", ["Marchés actifs", "URL / slug manuel"], index=0)
-if mode == "Marchés actifs" and markets:
-    _now = dt.datetime.now(dt.timezone.utc)
-    labels = [
-        f"⏳ {_fmt_rel((m['end'] - _now).total_seconds())}  ·  {m['range']}  ·  {m['duration']:.0f}j"
-        for m in markets
-    ]
-    idx = st.sidebar.selectbox("Choisir un marché (clôture la plus proche en premier)",
-                               range(len(markets)), format_func=lambda i: labels[i])
-    slug = markets[idx]["slug"]
+_now = dt.datetime.now(dt.timezone.utc)
+
+
+def _mkt_label(m: dict) -> str:
+    if m["start"] <= _now:
+        state = f"🔴 en cours · clôture dans {_fmt_rel((m['end'] - _now).total_seconds())}"
+    else:
+        state = f"🛒 pré-ouverture · démarre dans {_fmt_rel((m['start'] - _now).total_seconds())}"
+    return f"{m['range']}  ·  {m['duration']:.0f}j  ·  {state}"
+
+
+pc1, pc2 = st.columns([1.1, 3])
+dur_pick = pc1.radio("Durée", ["Tous", "2 jours", "7 jours"], horizontal=True, key="mkt_dur")
+group = [m for m in markets
+         if dur_pick == "Tous" or ((m["duration"] < 4) == (dur_pick == "2 jours"))]
+label_by_slug = {m["slug"]: _mkt_label(m) for m in group}
+slug = None
+if group:
+    opts = [m["slug"] for m in group]
+    # Widget KEY is the single source of truth — no explicit `index`. Passing `index` to a keyless
+    # selectbox makes it ignore the first click (you'd have to click twice); a key-bound selectbox
+    # updates its own state on the first interaction. To survive option changes (duration filter,
+    # live auto-refresh) we only reconcile when the remembered pick fell out of the list: reset it
+    # to opts[0] BEFORE the widget is built, so the box never holds an invalid value.
+    if st.session_state.get("market_pick") not in opts:
+        st.session_state["market_pick"] = opts[0]
+    slug = pc2.selectbox("Marché (clôture la plus proche en premier)", opts,
+                         format_func=lambda s: label_by_slug.get(s, s), key="market_pick")
 else:
-    url = st.sidebar.text_input(
-        "URL Polymarket ou slug",
-        value="elon-musk-of-tweets-june-26-july-3",
-    )
-    slug = D.slug_from_url(url)
+    st.info("Aucun marché actif dans cette catégorie.")
 
-n_sims = st.sidebar.select_slider("Simulations Monte-Carlo", [4000, 8000, 20000, 40000], value=20000)
+with st.expander("✍️ Ou coller une URL / un slug Polymarket (marché ancien, backtest…)"):
+    url = st.text_input("URL ou slug", value="", key="manual_url",
+                        placeholder="https://polymarket.com/event/elon-musk-of-tweets-… ou le slug")
+    if url.strip():
+        slug = D.slug_from_url(url.strip())
+        st.caption(f"→ slug utilisé : `{slug}` (prioritaire sur la liste ci-dessus)")
+
+if not slug:
+    st.stop()
+
+# immediate visual echo of the selection (the model recompute below can take ~10-30 s)
+st.markdown(f"#### 📍 {label_by_slug.get(slug, slug)}")
+
+n_sims = st.sidebar.select_slider(
+    "Simulations Monte-Carlo", [4000, 8000, 20000, 40000], value=8000,
+    help="8 000 = rapide pour naviguer entre marchés (probas quasi identiques). Monte à 20-40k pour "
+         "une précision maximale sur un marché donné.")
 half_life = st.sidebar.slider(
     "Demi-vie récence (jours)", 7, 60, 28,
     help="Vitesse d'oubli des vieux tweets pour le profil jour×heure. Plus court = colle au "
@@ -409,10 +1400,6 @@ if live:
                                         format_func=lambda x: f"{x}s")
     tick = st_autorefresh(interval=interval * 1000, key="live_tick")
     refresh_token = int(tick)  # changes each tick -> busts cached_run -> fresh pull + recompute
-
-if st.sidebar.button("🔄 Rafraîchir les données"):
-    cached_run.clear()
-    list_active_markets.clear()
 
 # --------------------------------------------------------------------------- #
 # Run
@@ -510,17 +1497,35 @@ st.caption(
     "basculer (incertitude = opportunité)."
 )
 
+# ---- ⚡ Live overreaction fade alert (validated crowd pattern) ----
+if not override and not settled:
+    _fsig = cached_fade_signals(slug, handle, refresh_token)
+    if _fsig:
+        _lines = " · ".join(
+            f"**{s['tranche']}** (YES {s['prix_yes']:.2f}, pic +{s['saut']:.0%}) → **NON @ {s['prix_no']:.2f}**"
+            for s in _fsig)
+        st.warning(
+            f"⚡ **Surréaction détectée — fade candidate(s)** : {_lines}\n\n"
+            "La foule a poussé ces tranches en zone mi-prix (0.25–0.75) sur un pic ; historiquement le "
+            "prix **revient** (backtest : +16–19 pts vs baseline, robuste en walk-forward). Piste : "
+            "**acheter NON** et sortir sous ~6 h. *Pas au-dessus de 0.75 (là le pic est mérité).*")
+
 df = pd.DataFrame(R["table"])
-df_disp = pd.DataFrame(
-    {
-        "Tranche": df["label"],
-        "Proba modèle": df["model_prob"],
-        "Prix OUI": df["yes_price"],
-        "Prix NON": df["no_price"],
-        "Action": df["best_side"],
-        "Edge du pari": df["best_edge"],
-    }
-)
+_mypos = cached_slug_positions(POS.load_wallet(), slug, refresh_token)
+_cols = {
+    "Tranche": df["label"],
+    "Proba modèle": df["model_prob"],
+    "Prix OUI": df["yes_price"],
+    "Prix NON": df["no_price"],
+    "Action": df["best_side"],
+    "Edge du pari": df["best_edge"],
+}
+if _mypos:  # only surface the position columns when the wallet actually holds this market
+    _lows = df["low"].astype(int)
+    _cols["Ma pos."] = [_mypos.get(l, {}).get("côté", "—") for l in _lows]
+    _cols["Entrée"] = [_mypos[l]["prix_entrée"] if l in _mypos else float("nan") for l in _lows]
+    _cols["Valeur $"] = [_mypos[l]["valeur_actuelle"] if l in _mypos else float("nan") for l in _lows]
+df_disp = pd.DataFrame(_cols)
 
 
 def _hl_action(row):
@@ -533,20 +1538,102 @@ def _hl_action(row):
     return [""] * len(row)
 
 
-styled = (
-    df_disp.style.format(
-        {"Proba modèle": "{:.1%}", "Prix OUI": "{:.2f}", "Prix NON": "{:.2f}",
-         "Edge du pari": "{:+.1%}"},
-        na_rep="—",
-    )
-    .apply(_hl_action, axis=1)
-)
+_fmt = {"Proba modèle": "{:.1%}", "Prix OUI": "{:.2f}", "Prix NON": "{:.2f}",
+        "Edge du pari": "{:+.1%}"}
+if _mypos:
+    _fmt.update({"Entrée": "{:.2f}", "Valeur $": "${:.2f}"})
+styled = df_disp.style.format(_fmt, na_rep="—").apply(_hl_action, axis=1)
 st.dataframe(styled, use_container_width=True, hide_index=True, height=min(680, 38 * (len(df) + 1)))
 st.caption(
     "**Action** = côté recommandé. 🟢 Vert = acheter **OUI** (tranche sous-cotée). "
     "🔵 Bleu = acheter **NON** (tranche surcotée). *Edge du pari* = avantage estimé du côté "
     "recommandé, après recalibrage γ. Seuls les paris à edge > 3 pts sont surlignés."
 )
+if _mypos:
+    _tot = sum(v["valeur_actuelle"] for v in _mypos.values())
+    _pnl = sum(v["pnl"] for v in _mypos.values())
+    st.caption(f"💼 **Mes positions sur ce marché** : {len(_mypos)} tranche(s), valeur totale "
+               f"**${_tot:,.2f}** · P&L latent **{_pnl:+,.2f}$** (côté & prix d'entrée par ligne "
+               "ci-dessus). Lecture seule via ton wallet.")
+
+render_decision_section(R)
+render_reliability_section(R)
+
+
+# --------------------------------------------------------------------------- #
+# Catalyst-research prompt — generated with live market/model context, to paste
+# manually into Claude (web search on). No API connection: the user runs it by hand
+# when they want a news read (e.g. a Grok release week that lifts Elon's activity).
+# --------------------------------------------------------------------------- #
+_JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
+            "août", "septembre", "octobre", "novembre", "décembre"]
+
+
+def _dt_fr(t: pd.Timestamp, jour: bool = True) -> str:
+    """'samedi 11 juillet 2026 07:53' — locale-independent French date."""
+    d = f"{t.day} {_MOIS_FR[t.month - 1]} {t.year} {t:%H:%M}"
+    return f"{_JOURS_FR[t.weekday()]} {d}" if jour else d
+
+
+def _catalyst_prompt(R: dict) -> str:
+    s = R["summary"]
+    ws = W.utc_ts(R["window_start"]).tz_convert("US/Eastern")
+    we = W.utc_ts(R["window_end"]).tz_convert("US/Eastern")
+    now_et = W.utc_ts(R["now"]).tz_convert("US/Eastern")
+    brackets = "\n".join(
+        f"  - {r['label']} tweets : {r['model_prob']:.0%}"
+        + (f" (prix marché OUI {r['yes_price']:.2f})" if r.get("yes_price") is not None else "")
+        for r in R["table"] if r["model_prob"] >= 0.02)
+    return f"""Tu es analyste pour un pari Polymarket sur le NOMBRE DE TWEETS d'Elon Musk (posts sur X, \
+comptés par xtracker.polymarket.com, retweets inclus).
+
+CONTEXTE DU MARCHÉ
+- Fenêtre de comptage : du {_dt_fr(ws)} au {_dt_fr(we)} (heure de l'Est, ET).
+- Nous sommes le {_dt_fr(now_et)} ET → il reste ~{s['hours_remaining']:.0f} h avant la clôture.
+- Tweets déjà comptés dans la fenêtre : {s['n_obs']}.
+- Mon modèle statistique (saisonnalité jour×heure + bursts auto-excitants, calibré sur son historique) \
+projette un TOTAL FINAL médian de {s['median']:.0f} tweets, intervalle 90% : {s['p5']:.0f}–{s['p95']:.0f}. \
+Son niveau hebdomadaire moyen récent est ~{R['mean_level']:.0f} tweets/semaine.
+- Probabilités du modèle par tranche (et prix actuels du marché) :
+{brackets}
+
+LIMITE CONNUE : ce modèle ne connaît QUE l'historique de ses tweets. Il est aveugle à l'actualité. \
+Or son volume explose lors d'événements (ex. : la release de Grok 4.5 cette semaine). Ta mission est de \
+combler ce trou.
+
+MISSION — avec la recherche web, identifie tout catalyseur d'ici la clôture ({_dt_fr(we, jour=False)} ET) \
+susceptible d'AUGMENTER ou de RÉDUIRE son volume de tweets. Couvre systématiquement :
+1. xAI / Grok : releases, annonces, benchmarks, polémiques IA.
+2. SpaceX : lancements (Starship surtout), tests, incidents.
+3. Tesla : résultats, livraisons, annonces produit, robotaxi, assemblées.
+4. Politique US : élections, feuds (avec qui est-il en conflit en ce moment ?), nominations, lois.
+5. Légal / médias : procès, dépositions, interviews, podcasts, documentaires.
+6. Son activité X ACTUELLE : est-il en rafale ces dernières 24-48 h ? sur quels sujets ? un thread \
+en cours ? A-t-il annoncé un déplacement/événement (qui réduit souvent son volume) ?
+
+FORMAT DE SORTIE
+a) Tableau : | Catalyseur | Date/heure estimée (ET) | Proba qu'il survienne | Impact volume attendu \
+(↑ faible +5-15% / ↑ moyen +15-40% / ↑ fort >+40% / ↓ réduction) | Justification (1 ligne, source datée) |
+b) VERDICT : ajustement suggéré du total médian ({s['median']:.0f} → ta fourchette), la tranche que tu \
+favorises parmi la liste ci-dessus, et ta confiance (faible/moyenne/haute).
+c) Ce qui pourrait invalider ton verdict (1-3 points).
+
+Règles : ne compte QUE des sources datées de moins de 7 jours ; distingue les faits programmés \
+(lancement annoncé) des spéculations ; si tu ne trouves rien de significatif, dis-le clairement — \
+« pas de catalyseur » est une réponse utile (le modèle statistique reste alors la meilleure estimation)."""
+
+
+with st.expander("🔮 Analyse des catalyseurs — prompt à coller dans Claude (recherche web)"):
+    st.markdown(
+        "Le modèle est **aveugle à l'actualité** (release Grok, lancement SpaceX, feud politique…). "
+        "Ce prompt — pré-rempli avec le contexte live du marché ci-dessus — se colle dans "
+        "**claude.ai** (active la recherche web) pour obtenir une lecture qualitative des "
+        "catalyseurs de la semaine. Manuel, gratuit, aucun appel API depuis l'app ; à toi de "
+        "décider si le verdict justifie d'ajuster ta mise.")
+    st.code(_catalyst_prompt(R), language=None)
+    st.caption("📋 Bouton *copier* en haut à droite du bloc. Le prompt embarque les chiffres du "
+               "dernier calcul — rafraîchis la page avant si besoin.")
 
 # --------------------------------------------------------------------------- #
 # Charts
@@ -575,6 +1662,49 @@ with col_r:
                        xaxis_title="tranche", yaxis_title="probabilité",
                        legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig2, use_container_width=True)
+
+# ---- Historical base rate vs model vs market, aligned to THIS market's brackets ----
+st.markdown("#### 📊 Où ont clôturé les marchés passés — Historique vs Modèle vs Marché")
+_is2d = R["duration_days"] < 4
+_n_avail = _n_resolved_same_duration(_is2d)
+if _n_avail < 4:
+    st.info(f"Pas encore assez de marchés {'2 jours' if _is2d else '7 jours'} résolus en base "
+            f"({_n_avail}) pour une distribution historique fiable.")
+else:
+    _n_recent = st.slider(
+        f"Marchés {'2 jours' if _is2d else '7 jours'} récents à inclure (les plus comparables)",
+        4, _n_avail, min(16, _n_avail), key="hist_n",
+        help="Le volume de tweets d'Elon dérive dans le temps : par défaut on ne prend que les "
+             "marchés récents, dont les tranches gagnantes ressemblent à celles d'aujourd'hui. "
+             "Élargis pour plus d'échantillon (mais risque de mélanger d'anciens régimes).")
+    _hfrac, _hn, _htot = _historical_bracket_dist(R["table"], _is2d, _n_recent)
+    _mkt = df["market_price"] if df["market_price"].notna().any() else pd.Series([np.nan] * len(df))
+    # focus on the relevant range: brackets where any of the three series is non-trivial
+    _mask = [(_hfrac[i] > 0) or (df["model_prob"].iloc[i] > 0.01)
+             or (pd.notna(_mkt.iloc[i]) and _mkt.iloc[i] > 0.01) for i in range(len(df))]
+    _labs = [df["label"].iloc[i] for i in range(len(df)) if _mask[i]]
+    _h = [_hfrac[i] for i in range(len(df)) if _mask[i]]
+    _mo = [df["model_prob"].iloc[i] for i in range(len(df)) if _mask[i]]
+    _ma = [_mkt.iloc[i] for i in range(len(df)) if _mask[i]]
+    fig3 = go.Figure()
+    fig3.add_bar(x=_labs, y=_h, name=f"Historique ({_hn} marchés)", marker_color="#8C8C8C")
+    fig3.add_bar(x=_labs, y=_mo, name="Modèle", marker_color="#4C9BE8")
+    if df["market_price"].notna().any():
+        fig3.add_bar(x=_labs, y=_ma, name="Marché", marker_color="#E8B04C")
+    fig3.update_layout(height=380, barmode="group", margin=dict(l=10, r=10, t=30, b=10),
+                       xaxis_title="tranche", yaxis_title="probabilité / fréquence",
+                       legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(fig3, use_container_width=True)
+    _tot_s = pd.Series(_htot)
+    st.caption(
+        f"⬜ **Historique** = fréquence à laquelle les **{_hn}** derniers marchés "
+        f"{'2 jours' if _is2d else '7 jours'} résolus ont clôturé dans chaque tranche "
+        f"(totaux réels {_tot_s.min():.0f}–{_tot_s.max():.0f}, médiane {_tot_s.median():.0f}), "
+        f"rangés dans les tranches **de ce marché-ci**. 🟦 **Modèle** et 🟧 **Marché** = probas "
+        f"actuelles. Lis-le comme un **taux de base** : si le modèle *et* le marché sur-cotent une "
+        f"tranche que l'historique récent atteint rarement, prudence ; si l'historique concentre "
+        f"une tranche que les deux sous-cotent, c'est une piste. ⚠️ Le volume d'Elon dérive — "
+        f"garde l'échantillon récent pour que la comparaison reste juste.")
 
 # ---- Per-day forecast: actuals + estimated, over the selected market window ----
 st.markdown("#### Prévision du nombre de tweets par jour (réels + estimés)")
@@ -616,11 +1746,115 @@ st.caption(
 st.markdown("#### Rythme de tweets — intensité par jour × heure (heure ET, pondérée récence)")
 hm = R["heatmap"]  # (7, 24) tweets/hour
 figh = go.Figure(
-    go.Heatmap(z=hm, x=[f"{h:02d}h" for h in range(24)], y=DAYS,
-               colorscale="YlOrRd", colorbar=dict(title="tw/h"))
+    go.Heatmap(z=hm, x=list(range(24)), y=DAYS,
+               colorscale="YlOrRd", colorbar=dict(title="tw/h"),
+               hovertemplate="%{y} %{x}h — %{z:.1f} tw/h<extra></extra>")
 )
-figh.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+# "Maintenant" marker: vertical line at the current ET hour + a box on today's cell
+now_et = W.utc_ts(R["now"]).tz_convert(W.ET)
+et_h = now_et.hour + now_et.minute / 60.0
+et_day = now_et.weekday()  # Mon=0, matches DAYS order
+figh.add_vline(x=et_h, line=dict(color="#00B3B3", width=2, dash="dash"))
+figh.add_annotation(x=et_h, y=1.02, yref="paper", showarrow=False,
+                    text=f"🕐 maintenant · {now_et:%a} {now_et:%H:%M} ET",
+                    font=dict(color="#008C8C", size=12), bgcolor="rgba(255,255,255,0.6)")
+figh.add_shape(type="rect", x0=now_et.hour - 0.5, x1=now_et.hour + 0.5,
+               y0=et_day - 0.5, y1=et_day + 0.5, xref="x", yref="y",
+               line=dict(color="#00B3B3", width=3), fillcolor="rgba(0,0,0,0)")
+
+# ---- realized tweets of the CURRENT window so far: per-cell counts + dotted outline of the
+# elapsed span (one rectangle per ET calendar day covered) ----
+_ws_ts = W.utc_ts(R["window_start"])
+_eff_end = min(W.utc_ts(R["now"]), W.utc_ts(R["window_end"]))
+_n_win = 0
+if _eff_end > _ws_ts:
+    _pw = D.load_posts(handle, start=_ws_ts.to_pydatetime(), end=_eff_end.to_pydatetime())
+    _n_win = len(_pw)
+    if _n_win:
+        _et_t = _pw["created_at"].dt.tz_convert(W.ET)
+        for (dw, hh), n in _pw.groupby([_et_t.dt.weekday, _et_t.dt.hour]).size().items():
+            figh.add_annotation(x=int(hh), y=int(dw), text=str(int(n)), showarrow=False,
+                                font=dict(size=10, color="#0B3D91"),
+                                bgcolor="rgba(255,255,255,0.72)", borderpad=1)
+    _cur = _ws_ts.tz_convert(W.ET)
+    _end_et = _eff_end.tz_convert(W.ET)
+    while _cur < _end_et:
+        _day_end = min(_cur.normalize() + pd.Timedelta(days=1), _end_et)
+        _h0 = _cur.hour + _cur.minute / 60.0
+        _h1 = (_day_end - _cur.normalize()).total_seconds() / 3600.0
+        figh.add_shape(type="rect", x0=_h0 - 0.5, x1=min(_h1, 24.0) - 0.5,
+                       y0=_cur.weekday() - 0.5, y1=_cur.weekday() + 0.5, xref="x", yref="y",
+                       line=dict(color="rgba(30,90,200,0.85)", width=1.5, dash="dot"),
+                       fillcolor="rgba(0,0,0,0)")
+        _cur = _day_end
+
+# ---- model forecast of the REMAINING tweets: full simulated distribution per future ET hour
+# (seasonal background + Hawkes bursts + conditional level). Shows the model's real behavior:
+# sleep hours (high P(0), tiny mean) stay blank, burst-prone hours are flagged. ----
+_fc_sum = 0.0
+if not settled and R.get("hourly"):
+    _we_et = W.utc_ts(R["window_end"]).tz_convert(W.ET)
+    # aggregate hourly buckets by (weekday, hour) cell — sums means, combines tails
+    _fc_cells: dict = {}
+    for _hcell in R["hourly"]:
+        _key = (_hcell["weekday"], _hcell["hour"])
+        _prev = _fc_cells.get(_key)
+        if _prev is None:
+            _fc_cells[_key] = dict(_hcell)
+        else:  # same cell hit twice (full-week window edge) -> merge conservatively
+            _prev["mean"] += _hcell["mean"]
+            _prev["p90"] = max(_prev["p90"], _hcell["p90"])
+            _prev["p_zero"] = min(_prev["p_zero"], _hcell["p_zero"])
+        _fc_sum += _hcell["mean"]
+    for (_wd, _hh), _c in _fc_cells.items():
+        if _c["mean"] < 0.25:  # near-dead hours -> blank cell
+            continue
+        _burst = _c["p90"] >= 4        # burst-prone: 1-in-10 chance of 4+ tweets that hour
+        _quiet = _c["p_zero"] >= 0.65  # probable silence (sleep-ish): dim it
+        if _burst:
+            _txt, _col, _bg = f"<b>~{_c['mean']:.1f}</b>", "#8A3B00", "rgba(255,236,208,0.85)"
+        elif _quiet:
+            _txt, _col, _bg = f"~{_c['mean']:.1f}", "#D9A05B", "rgba(255,248,238,0.45)"
+        else:
+            _txt, _col, _bg = f"~{_c['mean']:.1f}", "#C06A2A", "rgba(255,244,230,0.72)"
+        figh.add_annotation(x=int(_hh), y=int(_wd), text=_txt, showarrow=False,
+                            font=dict(size=9, color=_col), bgcolor=_bg, borderpad=1)
+    # invisible scatter -> hover with the full per-cell distribution.
+    # y must use the DAYS category labels (not numeric weekday indices), otherwise Plotly
+    # appends phantom numeric categories above the day rows and the axis scale breaks.
+    _hx = [hh for (_, hh) in _fc_cells]
+    _hy = [DAYS[wd] for (wd, _) in _fc_cells]
+    _hcust = [[c["mean"], c["p90"], c["p_zero"]] for c in _fc_cells.values()]
+    figh.add_trace(go.Scatter(
+        x=_hx, y=_hy, mode="markers", marker=dict(size=14, opacity=0),
+        customdata=_hcust, showlegend=False, hoverlabel=dict(bgcolor="#FFF3E0"),
+        hovertemplate="prévu %{customdata[0]:.1f} tweet(s) · p90 %{customdata[1]:.0f} · "
+                      "P(silence) %{customdata[2]:.0%}<extra>modèle</extra>"))
+    _cur2 = max(now_et, W.utc_ts(R["window_start"]).tz_convert(W.ET))
+    while _cur2 < _we_et:
+        _day_end2 = min(_cur2.normalize() + pd.Timedelta(days=1), _we_et)
+        _h0 = _cur2.hour + _cur2.minute / 60.0
+        _h1 = (_day_end2 - _cur2.normalize()).total_seconds() / 3600.0
+        figh.add_shape(type="rect", x0=_h0 - 0.5, x1=min(_h1, 24.0) - 0.5,
+                       y0=_cur2.weekday() - 0.5, y1=_cur2.weekday() + 0.5, xref="x", yref="y",
+                       line=dict(color="rgba(200,110,0,0.9)", width=1.5, dash="dot"),
+                       fillcolor="rgba(0,0,0,0)")
+        _cur2 = _day_end2
+
+figh.update_xaxes(tickmode="array", tickvals=list(range(0, 24, 2)),
+                  ticktext=[f"{h:02d}h" for h in range(0, 24, 2)])
+figh.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10))
 st.plotly_chart(figh, use_container_width=True)
+st.caption(f"🟦 trait + cadre plein = **heure ET actuelle** ({now_et:%A %H:%M}). "
+           f"🔵 pointillés bleus = **portion écoulée** ; chiffres bleus = tweets **réellement postés** "
+           f"par case ({_n_win} au total). "
+           f"🟧 pointillés orange = **portion à venir**, chiffres = tweets **prévus par le modèle** "
+           f"par case (simulation complète : saisonnalité + bursts + niveau ; ≈ **{_fc_sum:.0f}** au "
+           f"total d'ici la clôture). ⚠️ Le chiffre est une *moyenne* — Elon ne tweete pas 1/h : le "
+           f"modèle simule **65 % d'heures à zéro** et des rafales (validé sur 12 semaines). "
+           f"**Survole une case** pour voir p90 (potentiel de rafale) et P(silence). "
+           f"**Gras foncé** = risque de rafale (p90 ≥ 4) · **estompé** = silence probable "
+           "(P(0) ≥ 65 %, sommeil) · normal = activité régulière attendue.")
 st.caption(
     f"Hawkes: α={R['alpha']:.2f} (part de tweets déclenchés par 'burst'), "
     f"échelle de burst ≈ {R['burst_h']*60:.0f} min. "

@@ -13,7 +13,9 @@ import warnings
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+import os as _os
+_os.chdir(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
+sys.path.insert(0, "src")
 
 from tweetanalyst import calibration as C  # noqa: E402
 from tweetanalyst import data as D  # noqa: E402

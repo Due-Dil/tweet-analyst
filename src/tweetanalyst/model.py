@@ -263,6 +263,75 @@ def daily_forecast(
     return out
 
 
+def hourly_forecast(
+    fit: ModelFit,
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    n_sims: int = 2000,
+    rng: np.random.Generator | None = None,
+) -> list[dict]:
+    """Per-ET-HOUR simulated distribution of the remaining tweets (for the heatmap overlay).
+
+    Same simulation as ``daily_forecast`` (seasonal background + Hawkes bursts + conditional
+    level) but bucketed by ET hour, so each future heatmap cell gets the full distribution —
+    not just the smooth expectation. Returns one dict per remaining hour with weekday/hour
+    (ET), mean, p90 (burst potential) and p_zero (probability of silence, e.g. sleep).
+    """
+    rng = rng or np.random.default_rng(11)
+    posts = fit.posts
+    ws, we = W.utc_ts(window_start), W.utc_ts(window_end)
+    eff_now = max(W.utc_ts(fit.now), ws)
+    T_remaining = (we - eff_now).total_seconds() / 3600.0
+    if T_remaining <= 0:
+        return []
+
+    # hourly bucket edges aligned to ET hour boundaries (first bucket may be partial)
+    edge_ts, cur = [], (eff_now.tz_convert(W.ET).floor("h") + pd.Timedelta(hours=1)).tz_convert("UTC")
+    while cur < we:
+        edge_ts.append(cur)
+        cur += pd.Timedelta(hours=1)
+    edge_ts.append(we)
+    edges = np.array([(e - eff_now).total_seconds() / 3600.0 for e in edge_ts])
+
+    now_offset = (eff_now - ws).total_seconds() / 3600.0
+    n_h = int(np.ceil(T_remaining)) + 1
+    g_window = np.array([
+        168.0 * fit.intensity.shape[W.et_cell_of_offset(window_start, now_offset + k)]
+        for k in range(n_h)
+    ])
+    beta = fit.hawkes.beta
+    lookback_h = min(72.0, 8.0 / max(beta, 1e-3))
+    seed_evs = posts.loc[
+        (posts["created_at"] >= eff_now - pd.Timedelta(hours=lookback_h))
+        & (posts["created_at"] < eff_now), "created_at"
+    ]
+    Z0 = H.seed_decay_sum((eff_now - seed_evs).dt.total_seconds().values / 3600.0, beta)
+    lb_h = 3.0 * 24.0
+    lb_ref = (eff_now - pd.Timedelta(hours=lb_h)).to_pydatetime()
+    cond_count = int(((posts["created_at"] >= W.utc_ts(lb_ref))
+                      & (posts["created_at"] < eff_now)).sum())
+    cond_mass = float(sum(fit.intensity.shape[W.et_cell_of_offset(lb_ref, k)]
+                          for k in range(int(round(lb_h)))))
+    levels = fit.intensity.sample_level_conditional(rng, n_sims, cond_count, cond_mass)
+    buckets = H.simulate_remaining_daily(
+        rng, g_window, T_remaining, levels, fit.hawkes.alpha, beta,
+        np.full(n_sims, Z0), edges,
+    )
+
+    out, prev = [], eff_now
+    for i, e in enumerate(edge_ts):
+        cell = prev.tz_convert(W.ET)
+        col = buckets[:, i].astype(float)
+        out.append({
+            "weekday": int(cell.weekday()), "hour": int(cell.hour),
+            "mean": float(col.mean()),
+            "p90": float(np.percentile(col, 90)),
+            "p_zero": float((col == 0).mean()),
+        })
+        prev = e
+    return out
+
+
 def bracket_probabilities(
     brackets: list[Bracket], samples: np.ndarray, gamma: float = 1.0
 ) -> list[dict]:

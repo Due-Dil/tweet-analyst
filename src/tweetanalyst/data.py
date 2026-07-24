@@ -19,6 +19,7 @@ import requests
 
 XTRACKER_API = "https://xtracker.polymarket.com/api"
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 DEFAULT_HANDLE = "elonmusk"
 
 _CACHE_PATH = Path(__file__).resolve().parents[2] / "data" / "cache.db"
@@ -30,7 +31,11 @@ _UA = {"User-Agent": "tweet-analyst/1.0 (+research)"}
 # --------------------------------------------------------------------------- #
 def _conn(path: Path = _CACHE_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path))
+    con = sqlite3.connect(str(path), timeout=30.0)
+    # WAL lets a background archiver write prices while the app reads; busy_timeout waits out any lock
+    # instead of raising "database is locked".
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute(
         """CREATE TABLE IF NOT EXISTS posts (
                platform_id TEXT PRIMARY KEY,
@@ -240,33 +245,77 @@ def _parse_bracket_bounds(label: str) -> tuple[float, float]:
     return (float(lo), float(hi))
 
 
+def _fetch_midpoints(tokens: list) -> dict:
+    """Live order-book midpoints from the CLOB (one batched call) -> {token_id: price}.
+
+    This is the price Polymarket actually shows/trades on. Gamma's ``outcomePrices`` can lag the live
+    book, so we use this as the source of truth and fall back to Gamma only when a token is missing
+    (illiquid / no book). Returns {} on any failure (callers fall back to Gamma)."""
+    toks = [t for t in tokens if t]
+    if not toks:
+        return {}
+    try:
+        r = requests.post(f"{CLOB_API}/midpoints", json=[{"token_id": t} for t in toks],
+                          headers=_UA, timeout=20)
+        if r.status_code != 200:
+            return {}
+        out = {}
+        for k, v in (r.json().items() if isinstance(r.json(), dict) else []):
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def get_market(slug: str) -> MarketEvent:
+    import json
+
     data = _http_get(f"{GAMMA_API}/events", {"slug": slug})
     if not data:
         raise ValueError(f"No Polymarket event for slug={slug!r}")
     e = data[0]
-    brackets: list[Bracket] = []
+    # First pass: parse brackets + identify the YES/NO CLOB tokens and the Gamma price fallbacks.
+    parsed, all_tokens = [], []
     for m in e.get("markets", []):
         label = m.get("groupItemTitle") or m.get("question", "")
         lo, hi = _parse_bracket_bounds(label)
-        yes_price = None
-        prices = m.get("outcomePrices")
+        toks = m.get("clobTokenIds")
         outcomes = m.get("outcomes")
-        if isinstance(prices, str):
-            import json
+        prices = m.get("outcomePrices")
+        toks = json.loads(toks) if isinstance(toks, str) else toks
+        outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+        yes_tok = no_tok = g_yes = g_no = None
+        if outcomes:
+            low = [str(o).lower() for o in outcomes]
+            yi = low.index("yes") if "yes" in low else 0
+            ni = low.index("no") if "no" in low else (1 if len(low) > 1 else None)
+            if toks:
+                yes_tok = toks[yi] if yi < len(toks) else None
+                no_tok = toks[ni] if (ni is not None and ni < len(toks)) else None
+            if prices:
+                try:
+                    g_yes = float(prices[yi])
+                except (TypeError, ValueError, IndexError):
+                    pass
+                try:
+                    g_no = float(prices[ni]) if ni is not None else None
+                except (TypeError, ValueError, IndexError):
+                    pass
+        parsed.append((label, lo, hi, yes_tok, no_tok, g_yes, g_no))
+        all_tokens += [yes_tok, no_tok]
 
-            prices = json.loads(prices)
-            outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-        no_price = None
-        if prices and outcomes:
-            try:
-                yi = [o.lower() for o in outcomes].index("yes")
-                ni = [o.lower() for o in outcomes].index("no")
-                yes_price = float(prices[yi])
-                no_price = float(prices[ni])
-            except (ValueError, TypeError):
-                yes_price = float(prices[0])
-                no_price = float(prices[1]) if len(prices) > 1 else None
+    # Second pass: live CLOB midpoints (source of truth), Gamma as fallback.
+    mids = _fetch_midpoints(all_tokens)
+    brackets: list[Bracket] = []
+    for (label, lo, hi, yes_tok, no_tok, g_yes, g_no) in parsed:
+        yes_price = mids.get(yes_tok, g_yes) if yes_tok else g_yes
+        no_price = mids.get(no_tok) if no_tok else None
+        if no_price is None:
+            no_price = g_no if g_no is not None else (None if yes_price is None else 1.0 - yes_price)
         brackets.append(Bracket(label=label, low=lo, high=hi, yes_price=yes_price, no_price=no_price))
     brackets.sort(key=lambda b: b.low)
     return MarketEvent(
@@ -278,6 +327,33 @@ def get_market(slug: str) -> MarketEvent:
     )
 
 
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"], 1)}
+
+
+def _infer_span_days(text: str, end: dt.datetime) -> Optional[int]:
+    """Infer a market's length in days from the two <month>-<day> dates in its slug/title
+    (e.g. 'july-13-july-15' -> 2). Returns None if two dates can't be parsed."""
+    import re
+
+    pairs = re.findall(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"[\s\-]+([0-9]{1,2})", text.lower())
+    if len(pairs) < 2:
+        return None
+    (m1, d1), (m2, d2) = pairs[0], pairs[1]
+    try:
+        start = dt.date(end.year, _MONTHS[m1], int(d1))
+        finish = dt.date(end.year, _MONTHS[m2], int(d2))
+    except (ValueError, KeyError):
+        return None
+    if finish < start:  # Dec -> Jan year wrap
+        finish = dt.date(end.year + 1, _MONTHS[m2], int(d2))
+    span = (finish - start).days
+    return span if 1 <= span <= 14 else None
+
+
 def resolve_window(
     slug: str, market: MarketEvent, handle: str = DEFAULT_HANDLE
 ) -> tuple[dt.datetime, dt.datetime]:
@@ -286,7 +362,8 @@ def resolve_window(
     Gamma's ``event.startDate`` is the *creation* time, not the counting start, so we
     prefer the XTracker tracking window (exact, DST-correct, variable length). We match the
     tracking whose ``marketLink`` contains the slug; otherwise fall back to Gamma's reliable
-    ``end`` minus a length inferred from the title (default 7 days).
+    ``end`` minus a length inferred from the two dates in the slug/title (default 7 days) —
+    this is what lets a market XTracker hasn't tracked yet still be analysed via a pasted URL.
     """
     try:
         for tw in get_trackings(handle):
@@ -295,9 +372,10 @@ def resolve_window(
     except Exception:  # noqa: BLE001  (offline / API hiccup -> fall through)
         pass
     end = market.end
-    # Infer span from the title's two dates if possible, else assume a 7-day market.
-    span = dt.timedelta(days=7)
-    return end - span, end
+    span_days = _infer_span_days(slug, end)
+    if span_days is None:
+        span_days = _infer_span_days(getattr(market, "title", "") or "", end) or 7
+    return end - dt.timedelta(days=span_days), end
 
 
 def slug_from_url(url: str) -> str:

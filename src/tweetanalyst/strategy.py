@@ -26,6 +26,111 @@ from . import pipeline as P
 _SIDE_FR = {"YES": "OUI", "NO": "NON"}
 
 
+def polymarket_url(slug: str | None) -> str:
+    """Public Polymarket event page for a slug (where the user places orders)."""
+    return f"https://polymarket.com/event/{slug}" if slug else ""
+
+
+def kelly_horserace(p: np.ndarray, q: np.ndarray, eps: float = 1e-9) -> tuple[np.ndarray, float]:
+    """Joint full-Kelly allocation over mutually-exclusive bracket outcomes (Smoczynski-Tomkins).
+
+    The brackets of a market compete for ONE outcome, so independent per-bracket Kelly double-counts
+    correlated bets and over-deploys capital (the "correlation inflation"). This sizes the JOINT bet:
+    given model probs ``p`` (renormalized over the partition) and YES prices ``q``, it returns ``f[i]``
+    = fraction of bankroll to bet YES on bracket i, plus the cash reserve ``R``. Only positive-edge
+    brackets (with a real price) are retained; the optimum keeps ``R`` in cash and bets
+    ``f_i = p_i − R·q_i`` on the retained set, with Σf_i + R = 1. Betting YES across the partition
+    spans the whole outcome space, so explicit NO bets are unnecessary (and would be redundant)."""
+    p = np.asarray(p, float).copy()
+    q = np.clip(np.asarray(q, float), eps, 1.0 - eps)
+    s = p.sum()
+    if s <= 0:
+        return np.zeros(len(p)), 1.0
+    p = p / s
+    n = len(p)
+    S = [i for i in range(n) if p[i] > q[i] and q[i] >= 0.01]   # positive edge AND a real price
+    S.sort(key=lambda i: p[i] / q[i], reverse=True)
+    R = 1.0
+    while S:
+        P_ = float(sum(p[i] for i in S))
+        Q_ = float(sum(q[i] for i in S))
+        R = (1.0 - P_) / (1.0 - Q_) if (1.0 - Q_) > eps else 0.0
+        worst = S[-1]                              # lowest p_i/q_i in the retained set
+        if p[worst] / q[worst] <= R + eps:
+            S.pop()
+        else:
+            break
+    f = np.zeros(n)
+    for i in S:
+        f[i] = max(0.0, p[i] - R * q[i])
+    return f, R
+
+
+def kelly_portfolio(
+    p, yes_price, no_price, edge_threshold: float = 0.0, max_frac_per_bet: float = 1.0,
+) -> list[tuple[int, str, float, float]]:
+    """Joint Kelly over a market's mutually-exclusive brackets, allowing a YES *or* NO bet per bracket.
+
+    Generalizes ``kelly_horserace`` to use each bracket's **real, independently-quoted** NO price (on
+    Polymarket NO is not exactly 1−YES, so NO can be the cheaper way to express a view). It maximizes
+    expected **log-growth over the single winning outcome**, so the allocation is **coherent by
+    construction** — it never recommends contradictory bets, can stack multiple NO (compatible), and
+    will spread YES across adjacent brackets only when that genuinely maximizes growth (the dual of
+    NO-ing the rest). At most one side per bracket is considered (the positive-edge one).
+
+    Returns ``[(bracket_index, side, price, full_kelly_fraction), ...]`` (fraction of bankroll, before
+    applying the fractional-Kelly multiplier). Falls back to the YES-only horse-race if SciPy is
+    unavailable or the optimizer fails."""
+    p = np.asarray(p, float)
+    n = len(p)
+    s = p.sum()
+    if s <= 0:
+        return []
+    p = p / s
+    # one positive-edge instrument per bracket (the side the model favors at its real price)
+    insts: list[tuple[int, str, float]] = []
+    for i in range(n):
+        yq, nq = yes_price[i], no_price[i]
+        e_yes = (p[i] - yq) if (yq is not None and 0.0 < yq < 1.0) else -1.0
+        e_no = ((1.0 - p[i]) - nq) if (nq is not None and 0.0 < nq < 1.0) else -1.0
+        if e_yes >= e_no and e_yes > edge_threshold:
+            insts.append((i, "OUI", float(yq)))
+        elif e_no > edge_threshold:
+            insts.append((i, "NON", float(nq)))
+    if not insts:
+        return []
+    m = len(insts)
+    # excess-return matrix A[k, j] = (gross return per $ on instrument k if bracket j wins) − 1
+    A = np.full((m, n), -1.0)
+    for k, (i, side, price) in enumerate(insts):
+        if side == "OUI":
+            A[k, i] = 1.0 / price - 1.0
+        else:  # NO on i pays 1/price unless i wins
+            A[k, :] = 1.0 / price - 1.0
+            A[k, i] = -1.0
+    try:
+        from scipy.optimize import minimize  # lazy
+
+        def neg(x):
+            w = 1.0 + A.T @ x                     # wealth multiple if each bracket wins
+            return -float(np.sum(p * np.log(np.maximum(w, 1e-9))))
+
+        res = minimize(neg, np.full(m, min(0.5 / m, max_frac_per_bet)),
+                       method="SLSQP", bounds=[(0.0, max_frac_per_bet)] * m,
+                       constraints=[{"type": "ineq", "fun": lambda x: 1.0 - x.sum()}],
+                       options={"maxiter": 300, "ftol": 1e-10})
+        x = res.x if res.success else None
+    except Exception:  # noqa: BLE001
+        x = None
+    if x is None:
+        # fallback: YES-only horse-race (still coherent, just no NO instruments)
+        q = np.array([(yes_price[i] if (yes_price[i] is not None) else 1.0) for i in range(n)])
+        f, _ = kelly_horserace(p, q)
+        return [(i, "OUI", float(q[i]), float(f[i])) for i in range(n) if f[i] > 1e-4]
+    return [(insts[k][0], insts[k][1], insts[k][2], float(x[k]))
+            for k in range(m) if x[k] > 1e-4]
+
+
 def propose(
     bankroll: float = 1000.0,
     kelly_fraction: float = 0.25,
@@ -35,6 +140,9 @@ def propose(
                                     # σ-confidence is the real filter; a count floor wrongly blocks
                                     # confident low-volume forecasts)
     max_per_market_frac: float = 0.40,
+    sizing: str = "joint",          # "joint" = correlation-aware horse-race Kelly over the bracket
+                                    # partition (YES-only, realistic — backtest V1_joint); "naive" =
+                                    # independent per-bracket two-sided Kelly (legacy, inflates).
     handle: str = D.DEFAULT_HANDLE,
     now: dt.datetime | None = None,
     n_sims: int = 12000,
@@ -69,8 +177,15 @@ def propose(
         bracket_width = float(np.median(widths)) if widths else 20.0
         sigma_ratio = float(run.forecast.samples.std()) / bracket_width
         n_obs = run.forecast.n_obs
+        dur_days = total_h / 24.0
         markets_meta.append({"slug": slug, "title": run.market.title, "tau": tau,
-                             "sigma_ratio": sigma_ratio, "n_obs": n_obs, "window_end": run.window_end})
+                             "sigma_ratio": sigma_ratio, "n_obs": n_obs,
+                             "window_start": run.window_start, "window_end": run.window_end,
+                             "dur_days": dur_days,
+                             # per-bracket model probs + prices, so the app can compute value-at-risk
+                             "brackets": [{"label": t["label"], "model_prob": t["model_prob"],
+                                           "yes_price": t.get("yes_price"),
+                                           "no_price": t.get("no_price")} for t in run.table]})
         if n_obs < min_obs:
             skipped.append({"market": run.market.title,
                             "reason": f"trop peu de tweets observés ({n_obs} < {min_obs}) — pari sur "
@@ -81,23 +196,37 @@ def propose(
                             "reason": f"prévision pas assez nette (σ={sigma_ratio:.1f}×tranche > "
                                       f"{max_sigma_ratio:.1f}) — edge non fiable (τ={tau:.0%})"})
             continue
-        for t in run.table:
-            for side, price, p_side in (
-                ("OUI", t.get("yes_price"), t["model_prob"]),
-                ("NON", t.get("no_price"), 1.0 - t["model_prob"]),
-            ):
-                if price is None or price <= 0.0 or price >= 1.0:
-                    continue
-                edge = p_side - price
-                if edge <= edge_threshold:
-                    continue
-                kelly = edge / (1.0 - price)          # full-Kelly fraction of bankroll
-                f = max(0.0, kelly_fraction * kelly)  # fractional Kelly
-                cands.append({
-                    "slug": slug, "market": run.market.title, "tranche": t["label"], "côté": side,
-                    "prix": float(price), "proba_modèle": float(p_side), "edge": float(edge),
-                    "kelly_frac": float(f), "tau": tau, "window_end": run.window_end,
-                })
+        def _add(label, side, price, p_side, edge, kelly_frac):
+            cands.append({
+                "slug": slug, "market": run.market.title, "tranche": label, "côté": side,
+                "prix": float(price), "proba_modèle": float(p_side), "edge": float(edge),
+                "kelly_frac": float(kelly_frac), "tau": tau, "window_end": run.window_end,
+                "dur_days": total_h / 24.0,
+            })
+
+        if sizing == "joint":
+            # Correlation-aware joint allocation over the bracket partition, allowing a YES *or* NO
+            # bet per bracket (real prices). Coherent by construction (optimizes the single-winner
+            # outcome): stacks NO freely, spreads YES only when growth-optimal, never contradicts.
+            p_vec = [t["model_prob"] for t in run.table]
+            yp = [t.get("yes_price") for t in run.table]
+            nq = [t.get("no_price") for t in run.table]
+            for (i, side, price, f) in kelly_portfolio(p_vec, yp, nq, edge_threshold=edge_threshold):
+                t = run.table[i]
+                p_side = t["model_prob"] if side == "OUI" else 1.0 - t["model_prob"]
+                _add(t["label"], side, price, p_side, p_side - price, kelly_fraction * f)
+        else:
+            # Legacy naive: independent two-sided per-bracket Kelly (over-deploys; kept for comparison).
+            for t in run.table:
+                for side, price, p_side in (("OUI", t.get("yes_price"), t["model_prob"]),
+                                            ("NON", t.get("no_price"), 1.0 - t["model_prob"])):
+                    if price is None or price <= 0.0 or price >= 1.0:
+                        continue
+                    edge = p_side - price
+                    if edge <= edge_threshold:
+                        continue
+                    _add(t["label"], side, price, p_side, edge,
+                         max(0.0, kelly_fraction * edge / (1.0 - price)))
 
     # ---- allocation: raw fractional-Kelly stakes, then per-market cap, then global bankroll cap ----
     for c in cands:
@@ -174,20 +303,109 @@ def reconcile(bets: list[dict], current_positions: list[dict],
             act, reason = "✅ Conserver", "proche de la cible"
         actions.append({"marché": b["market"], "tranche": b["tranche"], "côté": b["côté"],
                         "action": act, "valeur_actuelle": cur_stake, "cible": tgt,
-                        "edge": b["edge"], "raison": reason})
-    # Held but no longer a target -> exit (model edge gone)
+                        "edge": b["edge"], "prix": b.get("prix"), "proba_modèle": b.get("proba_modèle"),
+                        "slug": b.get("slug"), "dur_days": b.get("dur_days"),
+                        "lien": polymarket_url(b.get("slug")), "raison": reason})
+    # Held but not in the target portfolio. EXIT only if the model edge on the held side has actually
+    # turned negative (the validated rule: cut on negative edge, hold winners). A still-positive-edge
+    # position is often just a slightly sub-optimal expression of a view the joint portfolio already
+    # covers via another bracket/side (e.g. holding "<40 YES" when the optimum is the equivalent
+    # "40-64 NO") — selling it would only churn spread, so KEEP it.
     for k, r in held.items():
         if k in target:
             continue
         edge = r.get("edge_côté")
         if edge is not None and edge < 0:
+            act = "🔴 Sortir"
             reason = f"edge négatif ({edge:.0%}) — le modèle n'y voit plus de valeur"
         else:
-            reason = "plus dans le portefeuille-cible (edge sous le seuil)"
+            act = "✅ Conserver"
+            reason = ("edge encore positif — hors portefeuille-cible (même vue déjà couverte via une "
+                      "autre tranche), mais le modèle reste favorable : garder")
         actions.append({"marché": r.get("marché"), "tranche": r.get("tranche"),
                         "côté": _SIDE_FR.get(str(r.get("côté")).upper(), r.get("côté")),
-                        "action": "🔴 Sortir", "valeur_actuelle": float(r.get("valeur_actuelle", 0)),
-                        "cible": 0.0, "edge": edge, "raison": reason})
+                        "action": act, "valeur_actuelle": float(r.get("valeur_actuelle", 0)),
+                        "cible": 0.0, "edge": edge, "prix": r.get("prix_marché"),
+                        "proba_modèle": r.get("proba_modèle_côté"), "slug": r.get("slug"),
+                        "dur_days": None, "lien": polymarket_url(r.get("slug")), "raison": reason})
     order = {"🔴 Sortir": 0, "🟠 Alléger": 1, "🟢 Entrer": 2, "🔵 Renforcer": 3, "✅ Conserver": 4}
     actions.sort(key=lambda a: (order.get(a["action"], 9), -a["valeur_actuelle"]))
     return actions
+
+
+# --------------------------------------------------------------------------- #
+# Value-at-risk on a holding set (current positions OR the strategy's target)
+# --------------------------------------------------------------------------- #
+def _norm_label(s: str) -> str:
+    return str(s).strip().replace("–", "-").replace("—", "-")
+
+
+def portfolio_risk(holdings: list[dict], brackets_by_slug: dict[str, list[dict]],
+                   n_mc: int = 20000, seed: int = 7) -> dict:
+    """How much a set of holdings can lose, per market and in total.
+
+    Each market resolves to ONE winning bracket, so a holding's payoff is discrete. Using the model's
+    bracket probabilities we get the P&L distribution and report, per market: ``max_loss`` (a losing
+    bracket wins — the worst case), ``var95_loss`` (loss not exceeded with 95% model-probability) and
+    ``expected_pnl``. The total combines markets by Monte-Carlo (they're independent), giving an
+    honest 90% P&L interval [p5, p95] rather than a naive sum of worst cases.
+
+    ``holdings``: dicts ``{slug, tranche, side, value, payoff}`` — ``side`` ∈ {OUI,NON,YES,NO},
+    ``value`` = capital engaged now (current value, or stake for a target), ``payoff`` = $ received if
+    that leg wins (= shares). ``brackets_by_slug``: ``{slug: [{label, model_prob}, ...]}``."""
+    import numpy as np
+
+    by_slug: dict[str, list[dict]] = defaultdict(list)
+    for h in holdings:
+        by_slug[h["slug"]].append(h)
+
+    per, dists = [], []
+    for slug, hs in by_slug.items():
+        value_total = float(sum(h["value"] for h in hs))
+        bks = brackets_by_slug.get(slug)
+        if not bks:
+            per.append({"slug": slug, "value": value_total, "max_loss": value_total,
+                        "var95_loss": value_total, "expected_pnl": float("nan"), "known": False})
+            continue
+        labels = [_norm_label(b["label"]) for b in bks]
+        probs = np.array([max(float(b.get("model_prob", 0.0)), 0.0) for b in bks])
+        probs = probs / probs.sum() if probs.sum() > 0 else np.ones(len(bks)) / len(bks)
+        finals = np.zeros(len(bks))
+        for j in range(len(bks)):
+            fv = 0.0
+            for h in hs:
+                is_yes = str(h["side"]).upper() in ("OUI", "YES")
+                win = (_norm_label(h["tranche"]) == labels[j]) if is_yes \
+                    else (_norm_label(h["tranche"]) != labels[j])
+                if win:
+                    fv += float(h["payoff"])
+            finals[j] = fv
+        pnls = finals - value_total
+        order = np.argsort(pnls)
+        cum = np.cumsum(probs[order])
+        k_lo = min(int(np.searchsorted(cum, 0.05)), len(order) - 1)
+        k_hi = min(int(np.searchsorted(cum, 0.95)), len(order) - 1)
+        per.append({"slug": slug, "value": value_total,
+                    "max_loss": float(value_total - finals.min()),
+                    "max_gain": float(finals.max() - value_total),
+                    "var95_loss": float(max(0.0, -pnls[order][k_lo])),
+                    "var95_gain": float(max(0.0, pnls[order][k_hi])),
+                    "expected_pnl": float((probs * pnls).sum()), "known": True})
+        dists.append((pnls, probs))
+
+    rng = np.random.default_rng(seed)
+    total_value = float(sum(p["value"] for p in per))
+    if dists:
+        sims = np.zeros(n_mc)
+        for pnls, probs in dists:
+            sims += pnls[rng.choice(len(pnls), size=n_mc, p=probs)]
+        total = {"value": total_value, "expected_pnl": float(sims.mean()),
+                 "max_loss": float(sum(p["max_loss"] for p in per if p["known"])),
+                 "max_gain": float(sum(p["max_gain"] for p in per if p["known"])),
+                 "var95_loss": float(max(0.0, -np.percentile(sims, 5))),
+                 "var95_gain": float(max(0.0, np.percentile(sims, 95))),
+                 "p5": float(np.percentile(sims, 5)), "p95": float(np.percentile(sims, 95))}
+    else:
+        total = {"value": total_value, "expected_pnl": float("nan"), "max_loss": total_value,
+                 "max_gain": 0.0, "var95_loss": total_value, "var95_gain": 0.0, "p5": 0.0, "p95": 0.0}
+    return {"per_market": per, "total": total}

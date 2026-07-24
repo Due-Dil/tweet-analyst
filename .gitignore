@@ -1,12 +1,13 @@
-# Local data cache (XTracker posts)
+# Local data cache (XTracker posts + CLOB prices + trades + resolved-market metadata)
 data/cache.db
+data/cache.db-shm
+data/cache.db-wal
 
 # Local tooling / editor config
 .claude/
 
-# Backtest outputs (regenerate with run_histbacktest.py)
-histbacktest.png
-histbacktest_*.csv
+# All collected backtest / post-mortem / order-book data (large, regenerable). See backtest_data/README.md
+backtest_data/
 
 # Python
 __pycache__/
@@ -17,7 +18,7 @@ venv/
 # OS / editor
 .DS_Store
 
-# Personal wallet address (local only)
+# Personal wallet address, bankroll & sync log (local only)
 data/wallet.txt
-strategy_backtest_*.csv
-strategy_gate_records.csv
+data/bankroll.txt
+data/sync.log

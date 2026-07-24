@@ -59,6 +59,10 @@ def run_forecast(
     posts = D.load_posts(
         handle, start=now - dt.timedelta(days=history_days), end=now
     )
+    # Optional low-latency X tail (Phase 2). Inert unless sources.LIVE_X_ENABLED — returns posts
+    # unchanged otherwise, and never alters the settled region (XTracker stays the resolution truth).
+    from . import sources as SRC
+    posts = SRC.augment_with_live(posts, handle, now)
 
     fit = M.fit_model(posts, now, fit_days=fit_days, half_life_days=half_life_days)
     fc = M.forecast(fit, window_start, window_end, n_sims=n_sims,
